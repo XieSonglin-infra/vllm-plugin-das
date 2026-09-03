@@ -135,12 +135,41 @@ class SlimQuantW4A8Facade(_SlimQuantFacade):
         return None
 
 
+class KimiK3W4A8Facade(_SlimQuantFacade):
+    """Kimi-K3-specific W4A8 registry entry with strict metadata checks."""
+
+    _registry_name = "kimi_k3_w4a8"
+    _implementation_module = (
+        "vllm_hcu.model_executor.layers.quantization.kimi_k3_w4a8"
+    )
+    _implementation_class = "KimiK3W4A8Config"
+
+    @classmethod
+    def override_quantization_method(
+        cls,
+        hf_quant_cfg: dict[str, Any],
+        user_quant: str | None,
+        hf_config: Any = None,
+    ) -> str | None:
+        if getattr(hf_config, "model_type", None) != "kimi_k3":
+            return None
+        if hf_quant_cfg.get("quant_method") not in {
+            "slimquant_w4a8",
+            "kimi_k3_w4a8",
+        }:
+            return None
+        if user_quant not in (None, cls._registry_name):
+            return None
+        return cls._registry_name
+
+
 SLIMQUANT_FACADES: dict[str, type[QuantizationConfig]] = {
     "slimquant_marlin": SlimQuantMarlinFacade,
     "slimquant_compressed_tensors_marlin": (
         SlimQuantCompressedTensorsMarlinFacade
     ),
     "slimquant_w4a8": SlimQuantW4A8Facade,
+    "kimi_k3_w4a8": KimiK3W4A8Facade,
 }
 
 
@@ -149,4 +178,5 @@ __all__ = [
     "SlimQuantCompressedTensorsMarlinFacade",
     "SlimQuantMarlinFacade",
     "SlimQuantW4A8Facade",
+    "KimiK3W4A8Facade",
 ]
