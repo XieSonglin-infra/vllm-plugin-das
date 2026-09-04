@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
+import inspect
 from typing import Any
 
 import torch
@@ -459,7 +460,7 @@ class KimiMLAAttention(nn.Module):
                 prefix=f"{prefix}.g_proj",
             )
 
-        mla_modules = MLAModules(
+        mla_kwargs = dict(
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
             rotary_emb=None,
@@ -476,8 +477,10 @@ class KimiMLAAttention(nn.Module):
             indexer=None,
             is_sparse=False,
             topk_indices_buffer=None,
-            g_proj=getattr(self, "g_proj", None),
         )
+        if "g_proj" in inspect.signature(MLAModules).parameters:
+            mla_kwargs["g_proj"] = getattr(self, "g_proj", None)
+        mla_modules = MLAModules(**mla_kwargs)
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
             self.num_local_heads,
