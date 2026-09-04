@@ -184,6 +184,11 @@ def apply_to_module(module: ModuleType) -> bool:
             kwargs.pop("activation_situ_linear_beta", None)
             if situ_beta is not None and "swiglu_beta" not in kwargs:
                 kwargs["swiglu_beta"] = situ_beta
+            if kwargs.get("activation") == "situ":
+                # vLLM 0.25.1 has no public ``situ`` activation enum.  The
+                # Kimi W4A8 quant method consumes the preserved beta values
+                # below and dispatches the actual SiTu kernel itself.
+                kwargs["activation"] = "silu"
         runner = factory(*args, **kwargs)
         if situ_beta is not None:
             runner.moe_config.activation_situ_beta = situ_beta
