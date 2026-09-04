@@ -36,6 +36,13 @@ _SAFETENSORS_DTYPE_TO_TORCH: dict[str, torch.dtype] = {
 }
 
 
+def _natural_sort_key(filepath: str) -> list[object]:
+    return [
+        int(part) if part.isdigit() else part
+        for part in re.split(r"(\d+)", os.path.basename(filepath))
+    ]
+
+
 def _require_exact_module(module: object, expected_name: str) -> ModuleType:
     if not isinstance(module, ModuleType) or module.__name__ != expected_name:
         actual_name = getattr(module, "__name__", None)
@@ -154,7 +161,7 @@ def _fake_safetensors_weights_iterator(
         should_skip_weight = _should_skip_weight
 
     layer_limit = _resolve_fake_layer_limit()
-    for st_file in sorted(hf_weights_files):
+    for st_file in sorted(hf_weights_files, key=_natural_sort_key):
         with safe_open(st_file, framework="pt", device="cpu") as checkpoint:
             for name in checkpoint.keys():
                 if should_skip_weight is not None and should_skip_weight(
