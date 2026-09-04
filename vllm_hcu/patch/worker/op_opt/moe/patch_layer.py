@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import sys
 from types import ModuleType
 
@@ -176,7 +177,18 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(factory)
     def hcu_factory(*args, **kwargs):
+        situ_beta = kwargs.get("activation_situ_beta")
+        situ_linear_beta = kwargs.get("activation_situ_linear_beta")
+        if "activation_situ_beta" not in inspect.signature(factory).parameters:
+            kwargs.pop("activation_situ_beta", None)
+            kwargs.pop("activation_situ_linear_beta", None)
+            if situ_beta is not None and "swiglu_beta" not in kwargs:
+                kwargs["swiglu_beta"] = situ_beta
         runner = factory(*args, **kwargs)
+        if situ_beta is not None:
+            runner.moe_config.activation_situ_beta = situ_beta
+        if situ_linear_beta is not None:
+            runner.moe_config.activation_situ_linear_beta = situ_linear_beta
         experts = runner.routed_experts
         if type(experts.quant_method) is not official_unquantized_cls:
             return runner
