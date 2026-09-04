@@ -166,7 +166,9 @@ def _make_fused_conv1d_weight_loader(
         loaded_weight: torch.Tensor,
         loaded_shard_id: int,
     ) -> None:
-        if loaded_weight.dim() == 2:
+        if loaded_weight.dim() == 3 and param.dim() == 2:
+            loaded_weight = loaded_weight.squeeze(1)
+        elif loaded_weight.dim() == 2 and param.dim() == 3:
             loaded_weight = loaded_weight.unsqueeze(1)
         shard_size = sharded_dims[loaded_shard_id]
         source_start = tp_rank * shard_size
