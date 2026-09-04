@@ -700,7 +700,10 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
-        if moe.activation.value != "situ":
+        # vLLM 0.25.x has no ``situ`` enum; the HCU legacy-MoE adapter carries
+        # the K3 beta through ``swiglu_beta`` and restores the semantic value
+        # on the completed config immediately after factory construction.
+        if moe.activation.value != "situ" and moe.swiglu_beta is None:
             raise ValueError("Kimi-K3 W4A8 only supports SiTU routed experts.")
 
     def create_weights(self, layer: RoutedExperts, num_experts: int, hidden_size: int,
