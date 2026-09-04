@@ -109,7 +109,15 @@ def install_kimi_k25_qkv_layout_compat(module: ModuleType) -> None:
                     f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
                 )
             self.video_attn_type = video_attn_type
-            qkv_hidden_size = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
+            qkv_hidden_size = block_cfg.get("qkv_hidden_size")
+            if qkv_hidden_size is None:
+                # vLLM 0.25.1's K25 wrapper omits this K3-only field while
+                # constructing block_cfg.  K3 keeps a 1536-wide QKV path
+                # over a 1024-wide token embedding (12 heads, 128 per head).
+                if block_cfg.get("hidden_dim") == 1024 and block_cfg.get("num_heads") == 12:
+                    qkv_hidden_size = 1536
+                else:
+                    qkv_hidden_size = block_cfg["hidden_dim"]
             self.rope_2d = module.Rope2DPosEmbRepeated(
                 qkv_hidden_size // block_cfg["num_heads"], 512, 512
             )
