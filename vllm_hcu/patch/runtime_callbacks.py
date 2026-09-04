@@ -204,6 +204,7 @@ def apply_kimi_k25_qkv_layout(module: ModuleType) -> None:
         "KimiK25MultiModalProjector",
         f"{target}.KimiK25MultiModalProjector",
     )
+    require_callable(module, "mm_projector_forward", f"{target}.mm_projector_forward")
     function = _load_runtime_callable(
         "vllm_hcu.runtime_compat.kimi_k25_vit",
         "install_kimi_k25_qkv_layout_compat",

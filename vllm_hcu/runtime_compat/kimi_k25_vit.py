@@ -26,6 +26,7 @@ def install_kimi_k25_qkv_layout_compat(module: ModuleType) -> None:
     base_layer = module.MoonViTEncoderLayer
     base_encoder = module.MoonViT3dEncoder
     base_projector = module.KimiK25MultiModalProjector
+    base_projector_forward = module.mm_projector_forward
 
     class HcuMoonViTEncoderLayer(base_layer):
         def __init__(
@@ -194,9 +195,24 @@ def install_kimi_k25_qkv_layout_compat(module: ModuleType) -> None:
             hidden_states, _ = self.linear_2(hidden_states)
             return self.post_norm(hidden_states)
 
+    @torch.inference_mode()
+    def hcu_mm_projector_forward(
+        mm_projector: nn.Module, vt_output: list[torch.Tensor]
+    ):
+        if getattr(mm_projector, "mm_projector_type", "patchmerger") != "patchmergerv2":
+            return base_projector_forward(mm_projector, vt_output)
+        num_embedding_list = [x.shape[0] for x in vt_output]
+        batched = torch.cat(vt_output, dim=0)
+        projector_dtype = mm_projector.linear_1.weight.dtype
+        if batched.dtype != projector_dtype:
+            batched = batched.to(projector_dtype)
+        proj_out = mm_projector(batched).reshape(-1, mm_projector.linear_2.output_size)
+        return torch.split(proj_out, num_embedding_list)
+
     module.MoonViTEncoderLayer = HcuMoonViTEncoderLayer
     module.MoonViT3dEncoder = HcuMoonViT3dEncoder
     module.KimiK25MultiModalProjector = HcuKimiK25MultiModalProjector
+    module.mm_projector_forward = hcu_mm_projector_forward
     module._hcu_kimi_k25_qkv_layout_patch_applied = True
 
 
