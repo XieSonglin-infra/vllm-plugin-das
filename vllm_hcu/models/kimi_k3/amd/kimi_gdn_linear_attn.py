@@ -23,6 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm_hcu.platforms import envs as henvs
 from vllm.model_executor.layers.fla.ops.kda import (
     FusedRMSNormGated,
 )
@@ -367,6 +368,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             params_dtype=torch.float32,
             prefix=f"{prefix}.conv1d",
         )
+        # HCU's NN-layout linear factory allocates [kernel, 1, output], while
+        # the Kimi KDA kernels and checkpoint use [output, 1, kernel].
+        if henvs.VLLM_USE_NN:
+            self.conv1d.weight.data = (
+                self.conv1d.weight.data.permute(1, 0).contiguous()
+            )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
         delattr(self.conv1d.weight, "weight_loader")
         set_weight_attrs(
