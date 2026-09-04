@@ -57,7 +57,6 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
-    get_spec_layer_idx_from_weight_name,
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
@@ -68,6 +67,23 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
+
+
+def get_spec_layer_idx_from_weight_name(config: Any, weight_name: str) -> int | None:
+    """Compatibility helper for vLLM wheels predating the MTP utility."""
+
+    num_nextn = getattr(config, "num_nextn_predict_layers", 0)
+    if not num_nextn:
+        return None
+    base_layer = config.num_hidden_layers
+    for index in range(num_nextn):
+        layer_index = base_layer + index
+        if weight_name.startswith((
+            f"model.layers.{layer_index}.",
+            f"layers.{layer_index}.",
+        )):
+            return layer_index
+    return None
 
 
 def _uses_native_k3_mxfp4_partition(
