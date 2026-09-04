@@ -247,4 +247,14 @@ class KimiK3ForConditionalGeneration(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
+        has_projector_post_norm = any(
+            name.startswith("mm_projector.post_norm.")
+            for name, _ in self.named_parameters()
+        )
+        if not has_projector_post_norm:
+            weights = (
+                item
+                for item in weights
+                if not item[0].startswith("mm_projector.post_norm.")
+            )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
