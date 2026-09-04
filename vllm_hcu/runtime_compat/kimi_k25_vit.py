@@ -119,6 +119,8 @@ def install_kimi_k25_qkv_layout_compat(module: ModuleType) -> None:
                     qkv_hidden_size = 1536
                 else:
                     qkv_hidden_size = block_cfg["hidden_dim"]
+            block_cfg = dict(block_cfg)
+            block_cfg["qkv_hidden_size"] = qkv_hidden_size
             self.rope_2d = module.Rope2DPosEmbRepeated(
                 qkv_hidden_size // block_cfg["num_heads"], 512, 512
             )
