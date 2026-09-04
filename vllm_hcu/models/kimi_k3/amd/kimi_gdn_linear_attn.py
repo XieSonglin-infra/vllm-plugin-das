@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import inspect
 from collections.abc import Callable
 
 import torch
@@ -53,6 +54,22 @@ from vllm_hcu.models.kimi_k3.amd.ops.gather_initial_states import (
 _KDA_GATE_LOGBOUND_MIN = -5.0
 
 logger = init_logger(__name__)
+
+_CAUSAL_CONV_UPDATE_HAS_OUT = "out" in inspect.signature(
+    causal_conv1d_update
+).parameters
+
+
+def _causal_conv1d_update_compat(*args, out=None, **kwargs):
+    """Bridge the vLLM 0.25 update API, which lacks ``out``."""
+
+    if _CAUSAL_CONV_UPDATE_HAS_OUT:
+        return causal_conv1d_update(*args, out=out, **kwargs)
+    result = causal_conv1d_update(*args, **kwargs)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
 def _use_ext_causal_conv1d() -> bool:
@@ -605,7 +622,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 dtype=mixed_qkv_spec.dtype,
                 device=mixed_qkv_spec.device,
             )
-            mixed_qkv_spec = causal_conv1d_update(
+            mixed_qkv_spec = _causal_conv1d_update_compat(
                 mixed_qkv_spec,
                 conv_state,
                 conv_weights,
@@ -793,7 +810,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                         dtype=mixed_qkv_ns.dtype,
                         device=mixed_qkv_ns.device,
                     )
-                    mixed_qkv_ns = causal_conv1d_update(
+                    mixed_qkv_ns = _causal_conv1d_update_compat(
                         mixed_qkv_ns,
                         conv_state,
                         conv_weights,
