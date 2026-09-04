@@ -93,9 +93,10 @@ class KimiK3ForConditionalGeneration(
 
         multimodal_config = model_config.multimodal_config
         assert multimodal_config is not None
-        self.use_data_parallel = is_vit_use_data_parallel(
-            config.vision_config.num_attention_heads
-        )
+        # vLLM 0.25.x exposes this helper without positional arguments;
+        # newer source revisions keep the argument optional and derive the
+        # mode from the multimodal runtime config.
+        self.use_data_parallel = is_vit_use_data_parallel()
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
 
