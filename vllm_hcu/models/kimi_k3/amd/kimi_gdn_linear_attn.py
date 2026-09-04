@@ -166,6 +166,29 @@ def _make_fused_conv1d_weight_loader(
         loaded_weight: torch.Tensor,
         loaded_shard_id: int,
     ) -> None:
+        if (
+            loaded_weight.dim() == 3
+            and param.dim() == 3
+            and param.shape[0] == loaded_weight.shape[-1]
+            and param.shape[-1] != loaded_weight.shape[-1]
+        ):
+            # Legacy vLLM stores ColumnParallelLinear weights as
+            # [kernel, 1, output], while K3 checkpoints use [output, 1, kernel].
+            loaded_weight = loaded_weight.transpose(0, 2)
+            shard_size = sharded_dims[loaded_shard_id]
+            source_start = tp_rank * shard_size
+            target_start = sum(sharded_dims[:loaded_shard_id])
+            loaded_shard = loaded_weight[..., source_start : source_start + shard_size]
+            target = param.data[..., target_start : target_start + shard_size]
+            if target.shape != loaded_shard.shape:
+                raise RuntimeError(
+                    "Kimi conv1d loader shape mismatch: "
+                    f"param={tuple(param.shape)} target={tuple(target.shape)} "
+                    f"loaded={tuple(loaded_weight.shape)} shard={tuple(loaded_shard.shape)} "
+                    f"shard_id={loaded_shard_id} tp={tp_size}"
+                )
+            target.copy_(loaded_shard)
+            return
         if loaded_weight.dim() == 3 and param.dim() == 2:
             loaded_weight = loaded_weight.squeeze(1)
         elif loaded_weight.dim() == 2 and param.dim() == 3:
