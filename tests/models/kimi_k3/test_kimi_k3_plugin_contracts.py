@@ -14,6 +14,9 @@ from vllm_hcu.model_executor.layers.quantization.kimi_k3_w4a8 import (
     unpack_int4_twos_complement,
     validate_kimi_k3_w4a8_metadata,
 )
+from vllm_hcu.model_executor.layers.quantization.slimquant_facade import (
+    KimiK3W4A8Facade,
+)
 
 
 def test_kimi_k3_w4a8_nibble_round_trip():
@@ -56,6 +59,12 @@ def test_situ_activation_shape_and_finiteness():
 
 def test_packing_contract_constant_is_explicit():
     assert KIMI_K3_W4A8_PACKING == "twos-complement-high-even-low-odd"
+
+
+def test_kimi_cli_quant_facade_materializes_without_hf_metadata():
+    facade = KimiK3W4A8Facade()
+    facade.maybe_update_config("Kimi-K3-INT4")
+    assert facade.get_quant_method(torch.nn.Linear(4, 4), "model.layers.0") is None
 
 
 def test_kimi_k3_patch_inventory_is_exact_and_version_neutral():

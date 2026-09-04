@@ -144,6 +144,55 @@ class KimiK3W4A8Facade(_SlimQuantFacade):
     )
     _implementation_class = "KimiK3W4A8Config"
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._materialized = None
+
+    def _materialized_config(self):
+        if self._materialized is None:
+            self._materialized = self._implementation()()
+        return self._materialized
+
+    def maybe_update_config(self, model_name: str, hf_config=None, revision=None):
+        del model_name, revision
+        implementation = self._implementation()
+        metadata = None
+        text_config = getattr(hf_config, "text_config", hf_config)
+        if text_config is not None:
+            from vllm_hcu.model_executor.layers.quantization.kimi_k3_w4a8 import (
+                KIMI_K3_W4A8_DEFAULT_METADATA,
+                KimiK3W4A8Metadata,
+            )
+
+            values = dict(KIMI_K3_W4A8_DEFAULT_METADATA)
+            values.update(
+                {
+                    "num_experts": getattr(
+                        text_config, "num_experts", values["num_experts"]
+                    ),
+                    "top_k": getattr(
+                        text_config,
+                        "num_experts_per_token",
+                        values["top_k"],
+                    ),
+                    "hidden_size": getattr(
+                        text_config,
+                        "routed_expert_hidden_size",
+                        values["hidden_size"],
+                    ),
+                    "intermediate_size": getattr(
+                        text_config,
+                        "moe_intermediate_size",
+                        values["intermediate_size"],
+                    ),
+                }
+            )
+            metadata = KimiK3W4A8Metadata(**values)
+        self._materialized = implementation(metadata)
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        return self._materialized_config().get_quant_method(layer, prefix)
+
     @classmethod
     def override_quantization_method(
         cls,

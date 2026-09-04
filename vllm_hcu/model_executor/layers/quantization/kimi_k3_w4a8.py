@@ -33,6 +33,13 @@ SLIMQUANT_W4A8_QUANT_METHOD = "slimquant_w4a8"
 KIMI_K3_W4A8_FORMAT = "kimi-k3-int4-w4a8-v1"
 KIMI_K3_W4A8_GROUP_SIZE = 32
 KIMI_K3_W4A8_PACKING = "twos-complement-high-even-low-odd"
+KIMI_K3_W4A8_DEFAULT_METADATA = {
+    "model_version": "slimquant_w4a8",
+    "num_experts": 896,
+    "top_k": 16,
+    "hidden_size": 3584,
+    "intermediate_size": 3072,
+}
 W4A8_MOE_BACKENDS = ("aiter", "triton", "lightop")
 logger = init_logger(__name__)
 
@@ -638,9 +645,11 @@ def run_aiter_w4a8_moe(
 class KimiK3W4A8Config(QuantizationConfig):
     """Explicit Kimi-K3 W4A8 method; only routed experts are quantized."""
 
-    def __init__(self, metadata: KimiK3W4A8Metadata):
+    def __init__(self, metadata: KimiK3W4A8Metadata | None = None):
         super().__init__()
-        self.metadata = metadata
+        self.metadata = metadata or KimiK3W4A8Metadata(
+            **KIMI_K3_W4A8_DEFAULT_METADATA
+        )
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
