@@ -174,6 +174,14 @@ def _make_fused_conv1d_weight_loader(
         source_start = tp_rank * shard_size
         target_start = sum(sharded_dims[:loaded_shard_id])
         loaded_shard = loaded_weight[source_start : source_start + shard_size]
+        if param.data[target_start : target_start + shard_size].shape != loaded_shard.shape:
+            raise RuntimeError(
+                "Kimi conv1d loader shape mismatch: "
+                f"param={tuple(param.shape)} target="
+                f"{tuple(param.data[target_start : target_start + shard_size].shape)} "
+                f"loaded={tuple(loaded_weight.shape)} shard={tuple(loaded_shard.shape)} "
+                f"shard_id={loaded_shard_id} tp={tp_size}"
+            )
         param.data[target_start : target_start + shard_size].copy_(loaded_shard)
 
     return weight_loader
