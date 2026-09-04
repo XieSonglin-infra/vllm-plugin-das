@@ -8,6 +8,7 @@ import functools
 import inspect
 import sys
 from types import ModuleType
+from types import SimpleNamespace
 
 from ._common import (
     PatchCompatibilityError,
@@ -190,6 +191,14 @@ def apply_to_module(module: ModuleType) -> bool:
                 # below and dispatches the actual SiTu kernel itself.
                 kwargs["activation"] = "silu"
         runner = factory(*args, **kwargs)
+        if kwargs.get("activation") == "silu" and situ_beta is not None:
+            # Keep the semantic activation visible to the Kimi quant method;
+            # the legacy factory only accepted ``silu`` during construction.
+            runner.moe_config.activation = SimpleNamespace(
+                value="situ",
+                is_gated=True,
+                custom_op_name="situ_and_mul",
+            )
         if situ_beta is not None:
             runner.moe_config.activation_situ_beta = situ_beta
         if situ_linear_beta is not None:
