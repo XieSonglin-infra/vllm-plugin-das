@@ -18,13 +18,14 @@ def _make_norm(module: ModuleType, norm_type: str, hidden_dim: int) -> nn.Module
 
 
 def install_kimi_k25_qkv_layout_compat(module: ModuleType) -> None:
-    """Use ``qkv_hidden_size`` when constructing Kimi-K3's vision tower."""
+    """Restore K3 vision layouts missing from the legacy K25 module."""
 
     if getattr(module, "_hcu_kimi_k25_qkv_layout_patch_applied", False):
         return
 
     base_layer = module.MoonViTEncoderLayer
     base_encoder = module.MoonViT3dEncoder
+    base_projector = module.KimiK25MultiModalProjector
 
     class HcuMoonViTEncoderLayer(base_layer):
         def __init__(
@@ -135,8 +136,65 @@ def install_kimi_k25_qkv_layout_compat(module: ModuleType) -> None:
                 module, block_cfg.get("norm_type", "layernorm"), hidden_dim
             )
 
+    class HcuKimiK25MultiModalProjector(base_projector):
+        """K25 projector with K3's ``patchmergerv2`` branch."""
+
+        def __init__(
+            self,
+            config,
+            use_data_parallel: bool = False,
+            quant_config=None,
+            prefix: str = "",
+        ) -> None:
+            if getattr(config, "mm_projector_type", "patchmerger") != "patchmergerv2":
+                super().__init__(
+                    config,
+                    use_data_parallel=use_data_parallel,
+                    quant_config=quant_config,
+                    prefix=prefix,
+                )
+                return
+
+            nn.Module.__init__(self)
+            self.use_data_parallel = use_data_parallel
+            self.mm_projector_type = "patchmergerv2"
+            merge_h, merge_w = config.merge_kernel_size
+            self.hidden_size = config.hidden_size * merge_h * merge_w
+            output_size = getattr(config, "text_hidden_size", None)
+            if output_size is None:
+                output_size = config.mm_hidden_size
+            self.linear_1 = module.ReplicatedLinear(
+                self.hidden_size,
+                self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.linear_1",
+            )
+            self.linear_2 = module.ReplicatedLinear(
+                self.hidden_size,
+                output_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.linear_2",
+            )
+            self.post_norm = nn.RMSNorm(
+                output_size,
+                eps=getattr(config, "projector_ln_eps", 1e-5),
+            )
+            self.act = module.GELUActivation()
+
+        def forward(self, image_features: torch.Tensor) -> torch.Tensor:
+            if self.mm_projector_type != "patchmergerv2":
+                return super().forward(image_features)
+            hidden_states = image_features.view(image_features.shape[0], -1)
+            hidden_states, _ = self.linear_1(hidden_states)
+            hidden_states = self.act(hidden_states)
+            hidden_states, _ = self.linear_2(hidden_states)
+            return self.post_norm(hidden_states)
+
     module.MoonViTEncoderLayer = HcuMoonViTEncoderLayer
     module.MoonViT3dEncoder = HcuMoonViT3dEncoder
+    module.KimiK25MultiModalProjector = HcuKimiK25MultiModalProjector
     module._hcu_kimi_k25_qkv_layout_patch_applied = True
 
 

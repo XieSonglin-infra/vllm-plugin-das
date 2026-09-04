@@ -199,6 +199,11 @@ def apply_kimi_k25_qkv_layout(module: ModuleType) -> None:
     module = require_exact_module(module, target)
     require_type(module, "MoonViTEncoderLayer", f"{target}.MoonViTEncoderLayer")
     require_type(module, "MoonViT3dEncoder", f"{target}.MoonViT3dEncoder")
+    require_type(
+        module,
+        "KimiK25MultiModalProjector",
+        f"{target}.KimiK25MultiModalProjector",
+    )
     function = _load_runtime_callable(
         "vllm_hcu.runtime_compat.kimi_k25_vit",
         "install_kimi_k25_qkv_layout_compat",
