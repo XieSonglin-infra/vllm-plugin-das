@@ -137,7 +137,10 @@ class KimiActivationTrace:
             snapshot = value[:rows, :cols].cpu() if value.ndim >= 2 else value[:cols].cpu()
         else:
             snapshot = value.cpu()
-        tensor_path = self._metadata.with_name(f"{self._metadata.stem}.{safe_name}.pt")
+        layer_suffix = f".layer{layer_idx}" if layer_idx is not None else ""
+        tensor_path = self._metadata.with_name(
+            f"{self._metadata.stem}.{safe_name}{layer_suffix}.pt"
+        )
         torch.save(snapshot, tensor_path)
         stats["tensor_file"] = tensor_path.name
         self._write(stats)
