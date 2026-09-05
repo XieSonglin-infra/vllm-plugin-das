@@ -64,6 +64,7 @@ from vllm.model_executor.models.utils import (
 )
 from bolt_ops.generic import attn_res
 from vllm.sequence import IntermediateTensors
+from vllm_hcu.models.kimi_k3.activation_trace import KimiActivationTrace
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 
@@ -722,6 +723,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        self._activation_trace = KimiActivationTrace.from_env(prefix)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -795,12 +797,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if self._activation_trace is not None:
+            self._activation_trace.begin(input_ids, positions)
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            if self._activation_trace is not None:
+                self._activation_trace.capture("embedding", hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -815,11 +821,19 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 self.layers[self.start_layer : self.end_layer],
                 start=self.start_layer,
             ):
+                if self._activation_trace is not None:
+                    self._activation_trace.capture(
+                        f"layer_{layer_idx}_input", hidden_states, layer_idx
+                    )
                 hidden_states, residual = layer(
                     positions=positions,
                     hidden_states=hidden_states,
                     residual=residual,
                 )
+                if self._activation_trace is not None:
+                    self._activation_trace.capture(
+                        f"layer_{layer_idx}_output", hidden_states, layer_idx
+                    )
                 self._maybe_add_hidden_state(
                     aux_hidden_states, layer_idx + 1, hidden_states, residual
                 )
@@ -849,11 +863,19 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
         ):
+            if self._activation_trace is not None:
+                self._activation_trace.capture(
+                    f"layer_{layer_idx}_input", hidden_states, layer_idx
+                )
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            if self._activation_trace is not None:
+                self._activation_trace.capture(
+                    f"layer_{layer_idx}_output", hidden_states, layer_idx
+                )
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 # AMD attn-res layer already returns prefix_sum + MLP delta as
                 # hidden_states; the override drops the block bank in residual.
@@ -1134,7 +1156,12 @@ class KimiLinearForCausalLM(
         # The model's final norm is applied here (not at the end of forward) so
         # that the pre-norm hidden states can be fed to the MTP draft model.
         hidden_states = self.model.norm(hidden_states, None)
-        return self.logits_processor(self.lm_head, hidden_states)
+        if self.model._activation_trace is not None:
+            self.model._activation_trace.capture("final_norm", hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if self.model._activation_trace is not None and logits is not None:
+            self.model._activation_trace.capture("logits", logits)
+        return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
