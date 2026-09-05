@@ -516,6 +516,7 @@ class KimiDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
+        self._activation_trace = None
 
         self.is_moe = config.is_moe
         layer_idx = self.layer_idx
@@ -643,10 +644,14 @@ class KimiDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self._run_self_attn(positions, hidden_states)
+        if self._activation_trace is not None:
+            self._activation_trace.capture("self_attn_output", hidden_states, self.layer_idx)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        if self._activation_trace is not None:
+            self._activation_trace.capture("mlp_output", hidden_states, self.layer_idx)
         return hidden_states, residual
 
     def forward_attn_residual(
@@ -670,6 +675,8 @@ class KimiDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self._run_self_attn(positions, hidden_states)
+        if self._activation_trace is not None:
+            self._activation_trace.capture("self_attn_output", hidden_states, self.layer_idx)
 
         if prefix_sum is not None:
             prefix_sum = prefix_sum + hidden_states
@@ -689,6 +696,8 @@ class KimiDecoderLayer(nn.Module):
 
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self._activation_trace is not None:
+            self._activation_trace.capture("mlp_output", hidden_states, self.layer_idx)
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, block_residual
 
@@ -724,6 +733,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
         self._activation_trace = KimiActivationTrace.from_env(prefix)
+        for layer in self.layers:
+            layer._activation_trace = self._activation_trace
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
