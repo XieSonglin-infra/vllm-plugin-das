@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
@@ -49,11 +50,15 @@ class KimiActivationTrace:
         self.max_calls = max(1, _int_env("VLLM_HCU_KIMI_TRACE_MAX_CALLS", 2))
         self.max_rows = max(1, _int_env("VLLM_HCU_KIMI_TRACE_MAX_ROWS", 1))
         self.max_cols = _int_env("VLLM_HCU_KIMI_TRACE_MAX_COLS", 0)
-        self.rank = (
-            os.environ.get("RANK")
-            or os.environ.get("LOCAL_RANK")
-            or os.environ.get("HIP_VISIBLE_DEVICES", "0")
-        )
+        self.input_sha256 = os.environ.get("VLLM_HCU_KIMI_TRACE_INPUT_SHA256")
+        self.rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK")
+        if self.rank is None:
+            try:
+                from vllm.distributed import get_tensor_model_parallel_rank
+
+                self.rank = str(get_tensor_model_parallel_rank())
+            except Exception:
+                self.rank = os.environ.get("HIP_VISIBLE_DEVICES", "0")
         self.call_index = 0
         self._metadata = None
 
@@ -69,6 +74,15 @@ class KimiActivationTrace:
         input_ids: torch.Tensor | None,
         positions: torch.Tensor | None,
     ) -> None:
+        input_digest = None
+        if input_ids is not None:
+            input_values = input_ids.detach().reshape(-1).cpu().tolist()
+            input_digest = hashlib.sha256(
+                ",".join(str(value) for value in input_values).encode("ascii")
+            ).hexdigest()
+        if self.input_sha256 and input_digest != self.input_sha256:
+            self._metadata = None
+            return
         self.call_index += 1
         if self.call_index > self.max_calls:
             self._metadata = None
@@ -82,6 +96,7 @@ class KimiActivationTrace:
             {
                 "kind": "input",
                 "shape": list(input_ids.shape) if input_ids is not None else None,
+                "input_sha256": input_digest,
                 "input_ids": input_ids.detach().cpu().tolist()
                 if input_ids is not None and input_ids.numel() <= 4096
                 else None,
