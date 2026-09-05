@@ -735,6 +735,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         self._activation_trace = KimiActivationTrace.from_env(prefix)
         for layer in self.layers:
             layer._activation_trace = self._activation_trace
+            if self._activation_trace is not None and hasattr(layer.mlp, "gate"):
+                layer.mlp.gate.register_forward_hook(
+                    lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
+                        "moe_router_logits",
+                        output[0] if isinstance(output, tuple) else output,
+                        idx,
+                    )
+                )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
