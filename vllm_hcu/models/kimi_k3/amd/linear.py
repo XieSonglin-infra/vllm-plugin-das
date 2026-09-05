@@ -743,6 +743,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                         idx,
                     )
                 )
+            if self._activation_trace is not None and getattr(layer.mlp, "shared_experts", None) is not None:
+                layer.mlp.shared_experts.register_forward_hook(
+                    lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
+                        "moe_shared_output",
+                        output[0] if isinstance(output, tuple) else output,
+                        idx,
+                    )
+                )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
