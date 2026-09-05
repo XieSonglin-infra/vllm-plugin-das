@@ -789,6 +789,22 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                     if transform is None:
                         transform = getattr(runner, "_routed_output_transform", None)
                     if transform is not None and hasattr(transform, "register_forward_hook"):
+                        if getattr(transform, "norm", None) is not None and hasattr(transform.norm, "register_forward_hook"):
+                            transform.norm.register_forward_hook(
+                                lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
+                                    "moe_routed_norm_output",
+                                    output[0] if isinstance(output, tuple) else output,
+                                    idx,
+                                )
+                            )
+                        if getattr(transform, "up_proj", None) is not None and hasattr(transform.up_proj, "register_forward_hook"):
+                            transform.up_proj.register_forward_hook(
+                                lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
+                                    "moe_routed_up_proj_output",
+                                    output[0] if isinstance(output, tuple) else output,
+                                    idx,
+                                )
+                            )
                         transform.register_forward_hook(
                             lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
                                 "moe_routed_transformed_output",
