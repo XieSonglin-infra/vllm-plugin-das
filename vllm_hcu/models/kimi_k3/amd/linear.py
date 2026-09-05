@@ -751,6 +751,32 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                         idx,
                     )
                 )
+            if self._activation_trace is not None:
+                runner = getattr(layer.mlp, "experts", None)
+                routed = getattr(runner, "routed_experts", None)
+                if routed is not None and not getattr(routed, "_kimi_trace_wrapped", False):
+                    original_forward_modular = routed.forward_modular
+                    trace = self._activation_trace
+                    idx = layer.layer_idx
+
+                    def traced_forward_modular(
+                        x, topk_weights, topk_ids, shared_experts=None,
+                        shared_experts_input=None, *,
+                        _trace=trace, _idx=idx,
+                        _original=original_forward_modular,
+                    ):
+                        _trace.capture("moe_routed_input", x, _idx)
+                        _trace.capture("moe_topk_weights", topk_weights, _idx)
+                        _trace.capture("moe_topk_ids", topk_ids, _idx)
+                        result = _original(
+                            x, topk_weights, topk_ids, shared_experts,
+                            shared_experts_input,
+                        )
+                        _trace.capture("moe_routed_output", result, _idx)
+                        return result
+
+                    routed.forward_modular = traced_forward_modular
+                    routed._kimi_trace_wrapped = True
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
