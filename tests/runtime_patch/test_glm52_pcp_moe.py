@@ -838,7 +838,7 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     runner = object.__new__(moe_runner_module.MoERunner)
     runner.moe_config = SimpleNamespace(hidden_dim_unpadded=2)
     runner.routed_experts = SimpleNamespace(
-        quant_method=SimpleNamespace(has_unpadded_output=False),
+        quant_method=SimpleNamespace(has_unpadded_output=False, moe_kernel=None),
     )
     runner.routed_input_transform = None
     runner.routed_output_transform = None
@@ -875,12 +875,12 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     monkeypatch.setattr(
         moe_runner_module.MoERunner,
         "_maybe_reduce_shared_expert_output",
-        lambda self, shared: shared,
+        lambda self, shared, _reduced=None: shared,
     )
     monkeypatch.setattr(
         moe_runner_module.MoERunner,
         "_maybe_reduce_final_output",
-        lambda self, output, _truncate: output,
+        lambda self, output, _truncate, _reduced=None: output,
     )
     monkeypatch.setattr(
         moe_runner_module.MoERunner,
@@ -894,3 +894,38 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
         output,
         torch.tensor([[110.0, 112.0], [220.0, 222.0]]),
     )
+
+
+def test_latent_routed_output_is_reduced_before_transform(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
+) -> None:
+    runner = object.__new__(moe_runner_module.MoERunner)
+    runner.routed_output_transform = object()
+    runner.moe_config = SimpleNamespace(
+        is_sequence_parallel=False,
+        tp_size=2,
+        ep_size=1,
+    )
+    calls: list[torch.Tensor] = []
+
+    def all_reduce(value: torch.Tensor) -> torch.Tensor:
+        calls.append(value.clone())
+        return value + 10
+
+    monkeypatch.setattr(
+        moe_runner_module,
+        "tensor_model_parallel_all_reduce",
+        all_reduce,
+    )
+    value = torch.tensor([[1.0, 2.0]])
+
+    output, reduced = runner._maybe_reduce_routed_output_before_transform(
+        value,
+        False,
+    )
+
+    assert reduced is True
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0], value)
+    torch.testing.assert_close(output, value + 10)
