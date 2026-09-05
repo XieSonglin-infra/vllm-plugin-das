@@ -5162,6 +5162,7 @@ class GPUModelRunner(
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
+        self._preload_unquantized_gemm_kernels()
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
@@ -5216,6 +5217,72 @@ class GPUModelRunner(
                 )
 
         get_offloader().post_init()
+
+    @torch.inference_mode()
+    def _preload_unquantized_gemm_kernels(self) -> None:
+        """Initialize HCU BF16 GEMM kernels before memory profiling."""
+        print("HCU GEMM preload entered", flush=True)
+        model = self.model
+        max_tokens = max(1, int(self.max_num_tokens))
+        m_values = sorted(
+            m
+            for m in {
+                1,
+                8,
+                32,
+                128,
+                512,
+                1024,
+                max(1, int(self.max_num_reqs)),
+                min(max_tokens, 4096),
+            }
+            if 1 <= m <= max_tokens
+        )
+
+        representatives: dict[tuple[int, int, torch.dtype, str], torch.Tensor] = {}
+        for module in model.modules():
+            weight = getattr(module, "weight", None)
+            if not isinstance(weight, torch.Tensor):
+                continue
+            # Embeddings and other matrix parameters are not HCU linear GEMMs.
+            if not hasattr(module, "quant_method"):
+                continue
+            if weight.ndim != 2 or weight.dtype != torch.bfloat16 or weight.is_meta:
+                continue
+            key = (
+                int(weight.shape[0]),
+                int(weight.shape[1]),
+                weight.dtype,
+                str(weight.device),
+            )
+            representatives.setdefault(key, weight)
+
+        if not representatives:
+            logger.info("HCU GEMM preload found no BF16 dense weights")
+            print("HCU GEMM preload found no BF16 dense weights", flush=True)
+            return
+
+        logger.info(
+            "Eagerly preloading %d BF16 GEMM shapes over M=%s before memory profile",
+            len(representatives),
+            m_values,
+        )
+        warmed = 0
+        for (dim0, dim1, dtype, device), weight in representatives.items():
+            for m in m_values:
+                input_dim = dim0 if henvs.VLLM_USE_NN else dim1
+                x = torch.empty((m, input_dim), dtype=dtype, device=device)
+                if henvs.VLLM_USE_NN:
+                    output = torch.matmul(x, weight)
+                else:
+                    output = torch.nn.functional.linear(x, weight)
+                del output, x
+                torch.accelerator.synchronize()
+                warmed += 1
+
+        torch.accelerator.empty_cache()
+        logger.info("Finished eager HCU GEMM preload: %d GEMM launches", warmed)
+        print(f"HCU GEMM preload finished: {warmed} launches", flush=True)
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.

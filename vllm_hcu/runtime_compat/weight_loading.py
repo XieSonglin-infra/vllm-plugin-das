@@ -137,13 +137,10 @@ def _fake_tensor_for_metadata(
         hashlib.blake2b(name.encode("utf-8"), digest_size=8).digest(),
         byteorder="little",
     )
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    return torch.empty(shape, dtype=dtype).uniform_(
-        -1e-3,
-        1e-3,
-        generator=generator,
-    )
+    # A deterministic per-key scalar avoids the very high CPU cost of filling
+    # every full expert tensor with a random distribution during full fake.
+    scalar = ((seed % 2001) - 1000) / 1e6
+    return torch.full(shape, scalar, dtype=dtype)
 
 
 def _fake_safetensors_weights_iterator(
