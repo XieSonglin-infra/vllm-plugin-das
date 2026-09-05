@@ -777,6 +777,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
 
                     routed.forward_modular = traced_forward_modular
                     routed._kimi_trace_wrapped = True
+                if runner is not None and hasattr(runner, "register_forward_hook"):
+                    runner.register_forward_hook(
+                        lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
+                            "moe_runner_output",
+                            output[0] if isinstance(output, tuple) else output,
+                            idx,
+                        )
+                    )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
