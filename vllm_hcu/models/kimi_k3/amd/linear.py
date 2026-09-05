@@ -785,6 +785,17 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                             idx,
                         )
                     )
+                    transform = getattr(runner, "routed_output_transform", None)
+                    if transform is None:
+                        transform = getattr(runner, "_routed_output_transform", None)
+                    if transform is not None and hasattr(transform, "register_forward_hook"):
+                        transform.register_forward_hook(
+                            lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
+                                "moe_routed_transformed_output",
+                                output[0] if isinstance(output, tuple) else output,
+                                idx,
+                            )
+                        )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
