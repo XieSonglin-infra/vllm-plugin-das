@@ -837,6 +837,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                         idx,
                     )
                 )
+                layer.input_layernorm.register_forward_hook(
+                    lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
+                        "input_norm_output",
+                        output[0] if isinstance(output, tuple) else output,
+                        idx,
+                    )
+                )
             if self._activation_trace is not None and hasattr(layer, "post_attention_layernorm"):
                 layer.post_attention_layernorm.register_forward_hook(
                     lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
@@ -860,6 +867,36 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                         idx,
                     )
                 )
+            if self._activation_trace is not None:
+                # Capture the shared projection boundaries for both KDA and MLA.
+                # Absent modules are skipped because layer types expose different APIs.
+                for module_name in (
+                    "in_proj_qkvgfab",
+                    "g_a_proj",
+                    "g_b_proj",
+                    "f_b_proj",
+                    "conv1d",
+                    "o_norm",
+                    "fused_qkv_a_proj",
+                    "kv_a_proj_with_mqa",
+                    "q_a_proj",
+                    "q_a_layernorm",
+                    "q_b_proj",
+                    "q_proj",
+                    "kv_a_layernorm",
+                    "kv_b_proj",
+                    "g_proj",
+                    "o_proj",
+                ):
+                    attn_module = getattr(layer.self_attn, module_name, None)
+                    if attn_module is not None and hasattr(attn_module, "register_forward_hook"):
+                        attn_module.register_forward_hook(
+                            lambda module, args, output, name=module_name, idx=layer.layer_idx: self._activation_trace.capture(
+                                f"attn_{name}",
+                                output[0] if isinstance(output, tuple) else output,
+                                idx,
+                            )
+                        )
             if self._activation_trace is not None and getattr(layer.mlp, "shared_experts", None) is not None:
                 layer.mlp.shared_experts.register_forward_hook(
                     lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
