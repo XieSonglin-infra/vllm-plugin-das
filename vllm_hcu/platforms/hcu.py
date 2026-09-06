@@ -151,9 +151,20 @@ def _get_backend_priorities(
         ]
 
     if use_mla:
+        # Keep the source/reference decode path as the default.  The old
+        # unconditional FLASHMLA-first order made
+        # VLLM_HCU_USE_FLASHMLA=0 ineffective: FLASHMLA was still selected
+        # whenever its configuration validated, introducing the HCU
+        # split-KV metadata/combine kernels in decode.  Opt into that path
+        # explicitly with VLLM_HCU_USE_FLASHMLA=1.
+        if henvs.VLLM_HCU_USE_FLASHMLA:
+            return [
+                AttentionBackendEnum.FLASHMLA,
+                AttentionBackendEnum.TRITON_MLA,
+            ]
         return [
-            AttentionBackendEnum.FLASHMLA,
             AttentionBackendEnum.TRITON_MLA,
+            AttentionBackendEnum.FLASHMLA,
         ]
     return [
         AttentionBackendEnum.FLASH_ATTN,
