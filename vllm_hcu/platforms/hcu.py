@@ -157,11 +157,16 @@ def _get_backend_priorities(
         # whenever its configuration validated, introducing the HCU
         # split-KV metadata/combine kernels in decode.  Opt into that path
         # explicitly with VLLM_HCU_USE_FLASHMLA=1.
-        if henvs.VLLM_HCU_USE_FLASHMLA:
+        if henvs.VLLM_HCU_USE_FLASHMLA and henvs.VLLM_HCU_FORCE_FLASHMLA:
             return [
                 AttentionBackendEnum.FLASHMLA,
                 AttentionBackendEnum.TRITON_MLA,
             ]
+        if henvs.VLLM_HCU_USE_FLASHMLA:
+            logger.warning(
+                "[HCU FLASHMLA]: decode safety fallback to TRITON_MLA; "
+                "set VLLM_HCU_FORCE_FLASHMLA=1 to run raw FlashMLA decode"
+            )
         return [
             AttentionBackendEnum.TRITON_MLA,
             AttentionBackendEnum.FLASHMLA,

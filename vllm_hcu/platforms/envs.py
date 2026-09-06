@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FLASH_ATTN_VARLEN: bool = True
     VLLM_HCU_USE_CUSTOM_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
+    VLLM_HCU_FORCE_FLASHMLA: bool = False
     VLLM_USE_OPT_CAT: bool = False
     VLLM_HCU_USE_CAT_MLA: bool = False
     VLLM_HCU_DISABLE_DSA: bool = False
@@ -187,6 +188,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # vLLM will use FlashMLA Backend on hcu
     "VLLM_HCU_USE_FLASHMLA":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "False").lower() in
+             ("true", "1")),
+    # HCU gfx93 FlashMLA decode is opt-in until its split-KV numerical path
+    # matches the source-equivalent Triton MLA implementation.
+    "VLLM_HCU_FORCE_FLASHMLA":
+    lambda: (os.environ.get("VLLM_HCU_FORCE_FLASHMLA", "False").lower() in
              ("true", "1")),
     # vLLM will use use opt cat 
     "VLLM_USE_OPT_CAT":

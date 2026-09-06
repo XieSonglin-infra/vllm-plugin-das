@@ -5,6 +5,7 @@
 
 from dataclasses import dataclass
 from typing import ClassVar
+import os
 
 import torch
 
@@ -50,6 +51,7 @@ import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 
 logger = init_logger(__name__)
+_FLASHMLA_DEBUG_DUMPED = False
 
 
 class HcuFlashMLABackend(MLACommonBackend):
@@ -306,6 +308,29 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         # TODO: (zyongye) decode function for mla here
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
+
+        global _FLASHMLA_DEBUG_DUMPED
+        if os.getenv("VLLM_HCU_FLASHMLA_DEBUG", "0") == "1" and not _FLASHMLA_DEBUG_DUMPED:
+            _FLASHMLA_DEBUG_DUMPED = True
+            sm = attn_metadata.decode.scheduler_metadata
+            q_info = (
+                [(tuple(x.shape), tuple(x.stride()), str(x.dtype), str(x.device)) for x in q]
+                if isinstance(q, tuple)
+                else (tuple(q.shape), tuple(q.stride()), str(q.dtype), str(q.device))
+            )
+            logger.warning(
+                "HCU FlashMLA debug: q=%s cache(shape=%s stride=%s dtype=%s device=%s) "
+                "block_table(shape=%s stride=%s dtype=%s) seq_lens(shape=%s stride=%s dtype=%s) "
+                "tile=%s num_splits=%s q_scale=%s k_scale=%s kv_dtype=%s",
+                q_info,
+                tuple(kv_c_and_k_pe_cache.shape), tuple(kv_c_and_k_pe_cache.stride()),
+                str(kv_c_and_k_pe_cache.dtype), str(kv_c_and_k_pe_cache.device),
+                tuple(attn_metadata.decode.block_table.shape), tuple(attn_metadata.decode.block_table.stride()),
+                str(attn_metadata.decode.block_table.dtype), tuple(attn_metadata.decode.seq_lens.shape),
+                tuple(attn_metadata.decode.seq_lens.stride()), str(attn_metadata.decode.seq_lens.dtype),
+                getattr(sm, "tile_scheduler_metadata", None), getattr(sm, "num_splits", None),
+                tuple(layer._q_scale.shape), tuple(layer._k_scale.shape), self.kv_cache_dtype,
+            )
 
         # if type(q) is tuple:
         #     q = torch.cat(q, dim=-1)
