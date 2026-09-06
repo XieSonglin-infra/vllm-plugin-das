@@ -636,6 +636,9 @@ class KimiDecoderLayer(nn.Module):
             assert residual is not None
             return self.forward_attn_residual(positions, hidden_states, residual)
 
+        if self._activation_trace is not None:
+            self._activation_trace.capture("layer_input_residual", residual, self.layer_idx)
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -643,12 +646,17 @@ class KimiDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        if self._activation_trace is not None:
+            self._activation_trace.capture("input_norm_residual_after", residual, self.layer_idx)
+
         hidden_states = self._run_self_attn(positions, hidden_states)
         if self._activation_trace is not None:
             self._activation_trace.capture("self_attn_output", hidden_states, self.layer_idx)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self._activation_trace is not None:
+            self._activation_trace.capture("post_attention_norm_residual_after", residual, self.layer_idx)
         hidden_states = self.mlp(hidden_states)
         if self._activation_trace is not None:
             self._activation_trace.capture("mlp_output", hidden_states, self.layer_idx)
