@@ -735,6 +735,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         self._activation_trace = KimiActivationTrace.from_env(prefix)
         for layer in self.layers:
             layer._activation_trace = self._activation_trace
+            if self._activation_trace is not None and hasattr(layer, "post_attention_layernorm"):
+                layer.post_attention_layernorm.register_forward_hook(
+                    lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
+                        "post_attention_norm_output",
+                        output[0] if isinstance(output, tuple) else output,
+                        idx,
+                    )
+                )
             if self._activation_trace is not None and hasattr(layer.mlp, "gate"):
                 layer.mlp.gate.register_forward_pre_hook(
                     lambda module, args, idx=layer.layer_idx: self._activation_trace.capture(
