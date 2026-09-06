@@ -743,6 +743,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         self._activation_trace = KimiActivationTrace.from_env(prefix)
         for layer in self.layers:
             layer._activation_trace = self._activation_trace
+            if self._activation_trace is not None:
+                layer.register_forward_pre_hook(
+                    lambda module, args, kwargs, idx=layer.layer_idx: self._activation_trace.capture(
+                        "layer_input_residual",
+                        args[2] if len(args) > 2 else kwargs.get("residual"),
+                        idx,
+                    ),
+                    with_kwargs=True,
+                )
             if self._activation_trace is not None and hasattr(layer, "post_attention_layernorm"):
                 layer.post_attention_layernorm.register_forward_hook(
                     lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
