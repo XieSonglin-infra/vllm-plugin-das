@@ -736,6 +736,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         for layer in self.layers:
             layer._activation_trace = self._activation_trace
             if self._activation_trace is not None and hasattr(layer.mlp, "gate"):
+                layer.mlp.gate.register_forward_pre_hook(
+                    lambda module, args, idx=layer.layer_idx: self._activation_trace.capture(
+                        "moe_gate_input",
+                        args[0] if args else torch.empty(0),
+                        idx,
+                    )
+                )
                 layer.mlp.gate.register_forward_hook(
                     lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
                         "moe_router_logits",
