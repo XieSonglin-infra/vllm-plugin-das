@@ -71,6 +71,15 @@ from vllm.utils.math_utils import cdiv
 logger = init_logger(__name__)
 
 
+def _apply_kimi_mla_output_gate(
+    attn_out: torch.Tensor,
+    hidden_states: torch.Tensor,
+    g_proj: nn.Module,
+) -> torch.Tensor:
+    """Apply Kimi's sigmoid gate before the MLA output projection."""
+    return attn_out * g_proj(hidden_states)[0].sigmoid()
+
+
 def get_spec_layer_idx_from_weight_name(config: Any, weight_name: str) -> int | None:
     """Compatibility helper for vLLM wheels predating the MTP utility."""
 
@@ -188,6 +197,60 @@ class KimiRoutedOutputTransform(nn.Module):
             hidden_states = self.norm(hidden_states)
         hidden_states, _ = self.up_proj(hidden_states)
         return hidden_states
+
+
+class _KimiMLAOutputGateCompat(MultiHeadLatentAttentionWrapper):
+    """Backport Kimi's MLA output gate to vLLM wheels without ``g_proj``."""
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        q_c = None
+        if self.q_lora_rank is not None:
+            assert self.fused_qkv_a_proj is not None
+            assert self.q_a_layernorm is not None
+            assert self.q_b_proj is not None
+            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            q_c, kv_lora = qkv_lora.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
+            )
+            q_c = self.q_a_layernorm(q_c)
+            q = self.q_b_proj(q_c)[0]
+        else:
+            assert self.kv_a_proj_with_mqa is not None
+            assert self.q_proj is not None
+            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+            q = self.q_proj(hidden_states)[0]
+
+        kv_c, k_pe = kv_lora.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        k_pe = k_pe.unsqueeze(1)
+        if self.rotary_emb is not None:
+            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                positions, q[..., self.qk_nope_head_dim :], k_pe
+            )
+        if self.indexer and self.is_sparse and not self.skip_topk:
+            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+        if llama_4_scaling is not None:
+            q *= llama_4_scaling
+
+        attn_out = self.mla_attn(
+            q,
+            kv_c_normed,
+            k_pe,
+            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+        )
+        g_proj = getattr(self, "g_proj", None)
+        if g_proj is not None:
+            attn_out = _apply_kimi_mla_output_gate(attn_out, hidden_states, g_proj)
+        return self.o_proj(attn_out)[0]
 
 
 def _apply_attn_res(
@@ -479,10 +542,14 @@ class KimiMLAAttention(nn.Module):
             is_sparse=False,
             topk_indices_buffer=None,
         )
-        if "g_proj" in inspect.signature(MLAModules).parameters:
+        has_native_output_gate = "g_proj" in inspect.signature(MLAModules).parameters
+        if has_native_output_gate:
             mla_kwargs["g_proj"] = getattr(self, "g_proj", None)
         mla_modules = MLAModules(**mla_kwargs)
-        self.mla_attn = MultiHeadLatentAttentionWrapper(
+        mla_wrapper_cls = MultiHeadLatentAttentionWrapper
+        if self.use_output_gate and not has_native_output_gate:
+            mla_wrapper_cls = _KimiMLAOutputGateCompat
+        self.mla_attn = mla_wrapper_cls(
             self.hidden_size,
             self.num_local_heads,
             self.scaling,
@@ -496,6 +563,8 @@ class KimiMLAAttention(nn.Module):
             quant_config,
             prefix,
         )
+        if self.use_output_gate and not has_native_output_gate:
+            self.mla_attn.g_proj = self.g_proj
 
     def forward(
         self,
