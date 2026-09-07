@@ -5280,6 +5280,40 @@ class GPUModelRunner(
                 torch.accelerator.synchronize()
                 warmed += 1
 
+        # The memory-profile sampler run feeds one token per request through
+        # model.compute_logits() (lm_head/logits GEMM). In a fresh worker that
+        # shape can cold-start with HIPBLAS_STATUS_INTERNAL_ERROR, so warm the
+        # exact logits path over max_num_reqs tokens (same call profile_run makes).
+        try:
+            num_sampled = max(1, int(self.max_num_reqs))
+            hidden_dim = None
+            for _m in self.model.modules():
+                _w = getattr(_m, "weight", None)
+                cls = type(_m).__name__
+                if (
+                    cls.endswith("LMHead") or cls == "VocabParallelEmbedding"
+                ) and isinstance(_w, torch.Tensor) and _w.ndim == 2 and not _w.is_meta:
+                    hidden_dim = int(_w.shape[1])
+                    break
+            if hidden_dim is None and representatives:
+                hidden_dim = next(iter(representatives))[1]
+            if hidden_dim is not None:
+                _xh = torch.empty(
+                    (num_sampled, hidden_dim), dtype=torch.bfloat16, device=self.device
+                )
+                with torch.no_grad():
+                    _lg = self.model.compute_logits(_xh)
+                del _lg, _xh
+                torch.accelerator.synchronize()
+                warmed += 1
+                logger.info(
+                    "Preloaded profile lm_head logits GEMM over %d tokens (hidden=%d)",
+                    num_sampled,
+                    hidden_dim,
+                )
+        except Exception as _exc:  # never fail the preload for a warmup miss
+            logger.warning("lm_head logits preload skipped: %r", _exc)
+
         torch.accelerator.empty_cache()
         logger.info("Finished eager HCU GEMM preload: %d GEMM launches", warmed)
         print(f"HCU GEMM preload finished: {warmed} launches", flush=True)
