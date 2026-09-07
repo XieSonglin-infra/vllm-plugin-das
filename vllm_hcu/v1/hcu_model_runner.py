@@ -5064,10 +5064,45 @@ class GPUModelRunner(
                 time_before_load = time.perf_counter()
                 if load_dummy_weights:
                     self.load_config.load_format = "dummy"
-                model_loader = get_model_loader(self.load_config)
-                self.model = model_loader.load_model(
-                    vllm_config=self.vllm_config, model_config=self.model_config
-                )
+                    model_loader = get_model_loader(self.load_config)
+                    self.model = model_loader.load_model(
+                        vllm_config=self.vllm_config,
+                        model_config=self.model_config,
+                    )
+                else:
+                    model_loader = get_model_loader(self.load_config)
+                    # Build the architecture, warm the BF16 GEMM kernels (shape
+                    # only, before any real weight bytes are read), then stream
+                    # the checkpoint weights -- mirrors BaseModelLoader.load_model
+                    # so GEMM/HIPBLAS problems surface before the slow load.
+                    from vllm.model_executor.model_loader.utils import (
+                        initialize_model,
+                        process_weights_after_loading,
+                    )
+                    from vllm.model_executor.model_loader.base_loader import (
+                        _has_online_quant,
+                    )
+                    from vllm.model_executor.model_loader.reload import (
+                        finalize_layerwise_processing,
+                    )
+                    from vllm.utils.torch_utils import set_default_torch_dtype
+
+                    with set_default_torch_dtype(self.model_config.dtype):
+                        with self.device:
+                            self.model = initialize_model(
+                                vllm_config=self.vllm_config,
+                                model_config=self.model_config,
+                            )
+                    self._preload_unquantized_gemm_kernels()
+                    model_loader.load_weights(self.model, self.model_config)
+                    if _has_online_quant(self.model):
+                        finalize_layerwise_processing(
+                            self.model, self.model_config
+                        )
+                    process_weights_after_loading(
+                        self.model, self.model_config, self.device
+                    )
+                    self.model = self.model.eval()
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -5162,7 +5197,10 @@ class GPUModelRunner(
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
-        self._preload_unquantized_gemm_kernels()
+        else:
+            # dummy/fake weights: nothing slow to stream, so warm after build
+            # (as before) to keep the fake/smoke path cold-start free.
+            self._preload_unquantized_gemm_kernels()
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
@@ -5220,7 +5258,16 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def _preload_unquantized_gemm_kernels(self) -> None:
-        """Initialize HCU BF16 GEMM kernels before memory profiling."""
+        """Warm HCU BF16 GEMM kernels BEFORE real checkpoint weights are streamed.
+
+        Runs right after the model architecture is built (weights may still be
+        empty or meta). The warmup only needs each parameter's shape/dtype, so
+        it launches each unique BF16 dense GEMM with its own dummy device
+        tensors. Doing this before the (slow) weight load means any
+        HIPBLAS/Tensile problem on these shapes surfaces immediately instead of
+        after the load, and profile_run reuses the warmed kernels (no cold-start
+        lm_head logits GEMM).
+        """
         print("HCU GEMM preload entered", flush=True)
         model = self.model
         max_tokens = max(1, int(self.max_num_tokens))
@@ -5239,80 +5286,54 @@ class GPUModelRunner(
             if 1 <= m <= max_tokens
         )
 
-        representatives: dict[tuple[int, int, torch.dtype, str], torch.Tensor] = {}
+        shapes: dict[tuple[int, int], torch.dtype] = {}
         for module in model.modules():
             weight = getattr(module, "weight", None)
             if not isinstance(weight, torch.Tensor):
                 continue
-            # Embeddings and other matrix parameters are not HCU linear GEMMs.
-            if not hasattr(module, "quant_method"):
-                continue
-            if weight.ndim != 2 or weight.dtype != torch.bfloat16 or weight.is_meta:
-                continue
-            key = (
-                int(weight.shape[0]),
-                int(weight.shape[1]),
-                weight.dtype,
-                str(weight.device),
+            cls = type(module).__name__
+            is_head = cls.endswith("LMHead") or cls in (
+                "VocabParallelEmbedding",
+                "ParallelEmbedding",
             )
-            representatives.setdefault(key, weight)
+            # Include HCU linear GEMM modules and the lm_head / embeddings
+            # (their profile-time logits GEMM otherwise cold-starts with
+            # HIPBLAS_STATUS_INTERNAL_ERROR). Shapes are enough; values are not.
+            if not (is_head or hasattr(module, "quant_method")):
+                continue
+            if weight.ndim != 2 or weight.dtype != torch.bfloat16:
+                continue
+            shapes.setdefault(
+                (int(weight.shape[0]), int(weight.shape[1])), weight.dtype
+            )
 
-        if not representatives:
+        if not shapes:
             logger.info("HCU GEMM preload found no BF16 dense weights")
             print("HCU GEMM preload found no BF16 dense weights", flush=True)
             return
 
         logger.info(
-            "Eagerly preloading %d BF16 GEMM shapes over M=%s before memory profile",
-            len(representatives),
+            "Eagerly preloading %d BF16 GEMM shapes over M=%s before weight load",
+            len(shapes),
             m_values,
         )
+        device = self.device
         warmed = 0
-        for (dim0, dim1, dtype, device), weight in representatives.items():
+        for (dim0, dim1), dtype in shapes.items():
+            # dummy weight on the worker device: kernel selection depends on
+            # shape/dtype/layout, not on the checkpoint values.
+            w = torch.empty((dim0, dim1), dtype=dtype, device=device)
             for m in m_values:
                 input_dim = dim0 if henvs.VLLM_USE_NN else dim1
                 x = torch.empty((m, input_dim), dtype=dtype, device=device)
                 if henvs.VLLM_USE_NN:
-                    output = torch.matmul(x, weight)
+                    output = torch.matmul(x, w)
                 else:
-                    output = torch.nn.functional.linear(x, weight)
+                    output = torch.nn.functional.linear(x, w)
                 del output, x
                 torch.accelerator.synchronize()
                 warmed += 1
-
-        # The memory-profile sampler run feeds one token per request through
-        # model.compute_logits() (lm_head/logits GEMM). In a fresh worker that
-        # shape can cold-start with HIPBLAS_STATUS_INTERNAL_ERROR, so warm the
-        # exact logits path over max_num_reqs tokens (same call profile_run makes).
-        try:
-            num_sampled = max(1, int(self.max_num_reqs))
-            hidden_dim = None
-            for _m in self.model.modules():
-                _w = getattr(_m, "weight", None)
-                cls = type(_m).__name__
-                if (
-                    cls.endswith("LMHead") or cls == "VocabParallelEmbedding"
-                ) and isinstance(_w, torch.Tensor) and _w.ndim == 2 and not _w.is_meta:
-                    hidden_dim = int(_w.shape[1])
-                    break
-            if hidden_dim is None and representatives:
-                hidden_dim = next(iter(representatives))[1]
-            if hidden_dim is not None:
-                _xh = torch.empty(
-                    (num_sampled, hidden_dim), dtype=torch.bfloat16, device=self.device
-                )
-                with torch.no_grad():
-                    _lg = self.model.compute_logits(_xh)
-                del _lg, _xh
-                torch.accelerator.synchronize()
-                warmed += 1
-                logger.info(
-                    "Preloaded profile lm_head logits GEMM over %d tokens (hidden=%d)",
-                    num_sampled,
-                    hidden_dim,
-                )
-        except Exception as _exc:  # never fail the preload for a warmup miss
-            logger.warning("lm_head logits preload skipped: %r", _exc)
+            del w
 
         torch.accelerator.empty_cache()
         logger.info("Finished eager HCU GEMM preload: %d GEMM launches", warmed)
