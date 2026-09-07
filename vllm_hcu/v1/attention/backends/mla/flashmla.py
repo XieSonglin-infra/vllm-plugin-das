@@ -56,7 +56,7 @@ _FLASHMLA_DEBUG_DUMPED = False
 # ---- temporary decode-input capture (precision diagnosis, env-gated) ----
 _FLASHMLA_CAPTURE_DIR = os.environ.get("VLLM_HCU_FLASHMLA_CAPTURE_DIR", "") or None
 _FLASHMLA_CAPTURE_N = [0]
-_FLASHMLA_CAPTURE_MAX = 24
+_FLASHMLA_CAPTURE_MAX = 300
 
 
 def _flashmla_capture(payload: dict) -> None:
