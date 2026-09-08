@@ -1,5 +1,6 @@
 """CPU-level contracts for the HCU-owned Kimi-K3 plugin surface."""
 
+import pytest
 import torch
 
 from vllm_hcu.patch.platform.core_fix import (
@@ -48,6 +49,36 @@ def test_kimi_k3_w4a8_metadata_rejects_wrong_packing():
         assert "packing" in str(exc)
     else:
         raise AssertionError("invalid packing must fail closed")
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        (
+            {
+                "quant_method": "slimquant_w4a8",
+                "num_experts": 2,
+                "top_k": 3,
+                "hidden_size": 32,
+                "intermediate_size": 32,
+            },
+            "top_k <= num_experts",
+        ),
+        (
+            {
+                "quant_method": "slimquant_w4a8",
+                "num_experts": 2,
+                "top_k": 1,
+                "hidden_size": 31,
+                "intermediate_size": 32,
+            },
+            "divisible by 32",
+        ),
+    ],
+)
+def test_slimquant_w4a8_metadata_rejects_invalid_kernel_dimensions(config, message):
+    with pytest.raises(ValueError, match=message):
+        validate_kimi_k3_w4a8_metadata(config)
 
 
 def test_situ_activation_shape_and_finiteness():

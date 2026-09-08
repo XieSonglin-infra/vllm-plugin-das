@@ -116,6 +116,34 @@ class KimiK3W4A8Metadata:
     hidden_size: int
     intermediate_size: int
 
+    def __post_init__(self) -> None:
+        """Keep every construction path at the same fail-closed boundary."""
+
+        if not isinstance(self.model_version, str) or not self.model_version:
+            raise ValueError(
+                "Kimi-K3 W4A8 metadata requires a non-empty model_version."
+            )
+
+        dimensions = {
+            "num_experts": self.num_experts,
+            "top_k": self.top_k,
+            "hidden_size": self.hidden_size,
+            "intermediate_size": self.intermediate_size,
+        }
+        for key, value in dimensions.items():
+            if type(value) is not int or value <= 0:
+                raise ValueError(
+                    f"Kimi-K3 W4A8 metadata requires positive integer {key}."
+                )
+        if self.top_k > self.num_experts:
+            raise ValueError(
+                "Kimi-K3 W4A8 metadata requires top_k <= num_experts."
+            )
+        if self.hidden_size % KIMI_K3_W4A8_GROUP_SIZE or (
+            self.intermediate_size % KIMI_K3_W4A8_GROUP_SIZE
+        ):
+            raise ValueError("Kimi-K3 W4A8 dimensions must be divisible by 32.")
+
 
 def validate_kimi_k3_w4a8_metadata(
     config: dict[str, Any], text_config: Any | None = None
