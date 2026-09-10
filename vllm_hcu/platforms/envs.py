@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     VLLM_HCU_KIMI_FAKE_WEIGHT_DEBUG : bool = False
     VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
+    VLLM_HCU_USE_CUSTOM_ALLREDUCE : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE: bool = True
     VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP: bool = True
@@ -164,9 +165,16 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # path to the logs of redirect-output, abstrac of related are ok
 
-    # If set, vLLM will transpose weight to use nn layout
+    # If set, vLLM will transpose weight to use nn layout.
+    # Default is False so unquantized linear layers keep the source vLLM
+    # layout: weight [out_features, in_features] applied with F.linear, which
+    # makes hipBLASLt pick the Alik non-transposed-A solution. With the old
+    # True default the weight was stored [in_features, out_features] and
+    # applied with matmul(x, W), selecting the Ailk solution that splits K
+    # (GSU8/16) and adds a per-step Cijk_B_PostGSU reduce kernel on
+    # single-token decode. Set VLLM_USE_NN=1 to restore the old behaviour.
     "VLLM_USE_NN":
-    lambda: (os.environ.get("VLLM_USE_NN", "True").lower() in 
+    lambda: (os.environ.get("VLLM_USE_NN", "False").lower() in
              ("true", "1")),
     # vLLM will use FlashAttention Backend on hcu, office attention layerout blocksize 128
     "VLLM_HCU_USE_FLASH_ATTN":
@@ -237,6 +245,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
             ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_RMS_NORM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_RMS_NORM", "True").lower() in
+             ("true", "1")),
+    # Keep RCCL/NCCL as the default TP collective path. The HCU P2P custom
+    # all-reduce remains available for an explicit opt-in.
+    "VLLM_HCU_USE_CUSTOM_ALLREDUCE":
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "False").lower() in
              ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_AITER_FLA":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_AITER_FLA", "True").lower() in

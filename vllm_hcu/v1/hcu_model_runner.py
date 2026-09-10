@@ -145,8 +145,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVCacheSpecKind,
     KVQuantMode,
     MambaSpec,
+    get_kv_cache_spec_kind,
     SlidingWindowSpec,
     TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
@@ -232,6 +234,9 @@ if TYPE_CHECKING:
 import vllm_hcu.platforms.envs as henvs 
 from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
 from vllm_hcu.patch.config import get_hcu_config
+from vllm_hcu.patch.worker.framework_opt.patch_slot_mapping_modes import (
+    set_slot_mapping_groups_without_slots,
+)
 
 logger = init_logger(__name__)
 
@@ -6916,11 +6921,22 @@ class GPUModelRunner(
         """
         block_sizes = []
         max_num_blocks = []
+        groups_without_slot_mapping = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
+            # Mamba/GDN groups keep recurrent state and address their block
+            # table through state_indices, so a per-token slot mapping is both
+            # unused and a wasted kernel launch. Upstream vLLM expresses this
+            # as SlotMappingMode.NONE; on this vLLM version the index is
+            # reported to the block-table adapter instead.
+            if (
+                get_kv_cache_spec_kind(kv_cache_group.kv_cache_spec)
+                == KVCacheSpecKind.MAMBA
+            ):
+                groups_without_slot_mapping.append(len(block_sizes))
             block_sizes.append(block_size)
             max_num_blocks_per_req = cdiv(
                 max_model_len, block_size * get_total_cp_world_size()
@@ -6953,6 +6969,9 @@ class GPUModelRunner(
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
                 reasoning_config=self.vllm_config.reasoning_config,
+            )
+            set_slot_mapping_groups_without_slots(
+                self.input_batch.block_table, groups_without_slot_mapping
             )
 
         assert self._init_block_sizes == block_sizes, (
