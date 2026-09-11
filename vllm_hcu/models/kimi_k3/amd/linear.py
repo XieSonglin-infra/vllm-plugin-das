@@ -191,6 +191,9 @@ class KimiRoutedOutputTransform(nn.Module):
         super().__init__()
         self.norm = norm
         self.up_proj = up_proj
+        # MoERunner uses this Kimi-specific capability to concatenate the
+        # latent routed and shared-expert partials before one TP all-reduce.
+        self._hcu_fuse_shared_and_routed_tp_all_reduce = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.norm is not None:

@@ -733,6 +733,13 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
         # on the completed config immediately after factory construction.
         if moe.activation.value != "situ" and moe.swiglu_beta is None:
             raise ValueError("Kimi-K3 W4A8 only supports SiTU routed experts.")
+        parallel = getattr(moe, "moe_parallel_config", None)
+        self.use_deepep_ht = bool(getattr(parallel, "use_deepep_ht_kernels", False))
+        self.use_deepep_ll = bool(getattr(parallel, "use_deepep_ll_kernels", False))
+        if self.use_deepep_ht and self.use_deepep_ll:
+            raise ValueError("Kimi-K3 cannot enable DeepEP HT and LL simultaneously")
+        if self.use_deepep_ll:
+            raise NotImplementedError("Kimi-K3 plugin DeepEP LL is not implemented")
 
     def create_weights(self, layer: RoutedExperts, num_experts: int, hidden_size: int,
                        intermediate_size_per_partition: int, params_dtype: torch.dtype,
@@ -781,6 +788,12 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
         with x16 at its own call site.
         """
 
+        if self.use_deepep_ht:
+            # Preserve canonical packed parameters for the loader. The HT
+            # expert owns the one-shot HIPC cache, bound by select_gemm_impl.
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            return
+
         if hasattr(layer, "w13_weight") and not getattr(
             layer, "_kimi_w4a8_aiter_repacked", False
         ):
@@ -799,11 +812,37 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
         }
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig | None:
+        if self.use_deepep_ht:
+            return FusedMoEQuantConfig.make(
+                torch.int8, weight_dtype="int4", per_act_token_quant=True,
+                per_out_ch_quant=False, block_shape=None,
+                w1_scale=layer.w13_weight_scale * 16.0,
+                w2_scale=layer.w2_weight_scale * 16.0,
+                a1_scale=None, a2_scale=None,
+            )
         return None
+
+    def select_gemm_impl(self, prepare_finalize, layer: RoutedExperts):
+        from vllm.model_executor.layers.fused_moe.modular_kernel import (
+            FusedMoEActivationFormat,
+        )
+        if not self.use_deepep_ht or (
+            prepare_finalize.activation_format != FusedMoEActivationFormat.Standard
+        ):
+            raise ValueError("Kimi-K3 HT requires Standard contiguous experts")
+        if self.moe_quant_config is None:
+            raise RuntimeError("Kimi-K3 HT requires quant config before expert selection")
+        from .kimi_k3_ht_runtime import KimiK3HTExperts
+
+        experts = KimiK3HTExperts(self.moe, self.moe_quant_config)
+        experts.process_weights_after_loading(layer)
+        return experts
 
     def apply(self, layer: RoutedExperts, x: torch.Tensor,
               topk_weights: torch.Tensor, topk_ids: torch.Tensor,
               shared_experts, shared_experts_input: torch.Tensor | None) -> torch.Tensor:
+        if self.use_deepep_ht:
+            raise RuntimeError("Kimi-K3 HT requires the modular DeepGEMM expert path")
         beta = layer.moe_config.activation_situ_beta
         if beta is None:
             raise ValueError("Kimi-K3 W4A8 requires activation_situ_beta.")

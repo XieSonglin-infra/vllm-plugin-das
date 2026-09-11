@@ -425,9 +425,23 @@ class HCUPlatform(Platform):
     
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # We only enable custom allreduce for MI300 series
-        # return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
-        return True
+        # Match the standard ROCm path by default. The HCU P2P implementation
+        # changes the TP collective backend and is only enabled explicitly.
+        return henvs.VLLM_HCU_USE_CUSTOM_ALLREDUCE
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        # HCU Kimi runs may request torch.compile but fall back at runtime.
+        # Prefer the same ROCm C kernels used by the source path rather than
+        # selecting native decomposition solely from the requested mode.
+        default = ["vllm_c", "native"]
+        return IrOpPriorityConfig.with_default(
+            default, rms_norm=default, fused_add_rms_norm=default
+        )
     
     @classmethod
     def device_count(cls) -> int:

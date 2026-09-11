@@ -901,6 +901,7 @@ def test_latent_routed_output_is_reduced_before_transform(
     moe_runner_module: ModuleType,
 ) -> None:
     runner = object.__new__(moe_runner_module.MoERunner)
+    runner.layer_name = "model.layers.0.mlp.experts"
     runner.routed_output_transform = object()
     runner.moe_config = SimpleNamespace(
         is_sequence_parallel=False,
@@ -929,3 +930,56 @@ def test_latent_routed_output_is_reduced_before_transform(
     assert len(calls) == 1
     torch.testing.assert_close(calls[0], value)
     torch.testing.assert_close(output, value + 10)
+
+
+def test_kimi_k3_latent_fuses_shared_and_routed_all_reduces(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
+) -> None:
+    runner = object.__new__(moe_runner_module.MoERunner)
+    runner.layer_name = "model.layers.0.mlp.experts"
+    runner._shared_experts = object()
+    runner.routed_output_transform = SimpleNamespace(
+        _hcu_fuse_shared_and_routed_tp_all_reduce=True,
+    )
+    runner.moe_config = SimpleNamespace(
+        is_sequence_parallel=False,
+        tp_size=2,
+    )
+    calls: list[torch.Tensor] = []
+
+    def all_reduce(value: torch.Tensor) -> torch.Tensor:
+        calls.append(value.clone())
+        return value * 2
+
+    monkeypatch.setattr(
+        moe_runner_module,
+        "tensor_model_parallel_all_reduce",
+        all_reduce,
+    )
+    fused_output = torch.tensor([[1.0, 2.0]])
+    shared_output = torch.tensor([[3.0, 4.0, 5.0]])
+
+    assert not runner._can_fuse_kimi_k3_latent_all_reduce(
+        shared_output,
+        fused_output,
+        False,
+    )
+    monkeypatch.setenv("VLLM_HCU_KIMI_LATENT_MOE_FUSE_ALLREDUCE", "1")
+    assert runner._can_fuse_kimi_k3_latent_all_reduce(
+        shared_output,
+        fused_output,
+        False,
+    )
+    fused_output, shared_output = runner._fuse_kimi_k3_latent_all_reduce(
+        shared_output,
+        fused_output,
+    )
+
+    assert len(calls) == 1
+    torch.testing.assert_close(
+        calls[0],
+        torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]]),
+    )
+    torch.testing.assert_close(fused_output, torch.tensor([[2.0, 4.0]]))
+    torch.testing.assert_close(shared_output, torch.tensor([[6.0, 8.0, 10.0]]))

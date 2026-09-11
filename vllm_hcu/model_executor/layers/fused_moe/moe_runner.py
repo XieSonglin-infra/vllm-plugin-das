@@ -5,6 +5,7 @@
 """HCU-owned v0.25.1 MoE runner with pre-quantized input support."""
 
 import inspect
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -58,6 +59,7 @@ from vllm.utils.torch_utils import (
     LayerName,
     direct_register_custom_op,
 )
+from vllm_hcu.model_executor.layers.tp_allreduce_trace import tp_all_reduce_trace
 
 logger = init_logger(__name__)
 
@@ -560,7 +562,8 @@ class MoERunner(MoERunnerInterface):
             and not self.moe_config.is_sequence_parallel
             and fused_output_is_reduced
         ):
-            shared_output = tensor_model_parallel_all_reduce(shared_output)
+            with tp_all_reduce_trace(f"moe_shared:{self.layer_name}"):
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
 
     def _maybe_reduce_routed_output_before_transform(
@@ -575,9 +578,52 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not fused_output_is_reduced
         ):
-            fused_output = tensor_model_parallel_all_reduce(fused_output)
+            with tp_all_reduce_trace(f"moe_routed:{self.layer_name}"):
+                fused_output = tensor_model_parallel_all_reduce(fused_output)
             fused_output_is_reduced = True
         return fused_output, fused_output_is_reduced
+
+    def _can_fuse_kimi_k3_latent_all_reduce(
+        self,
+        shared_output: torch.Tensor | None,
+        fused_output: torch.Tensor,
+        fused_output_is_reduced: bool,
+    ) -> bool:
+        """Whether Kimi-K3 can reduce its latent and shared partials together."""
+        fusion_enabled = os.environ.get(
+            "VLLM_HCU_KIMI_LATENT_MOE_FUSE_ALLREDUCE",
+            "0",
+        ).lower() in ("true", "1")
+        return (
+            fusion_enabled
+            and getattr(
+                self.routed_output_transform,
+                "_hcu_fuse_shared_and_routed_tp_all_reduce",
+                False,
+            )
+            and shared_output is not None
+            and self._shared_experts is not None
+            and self.moe_config.tp_size > 1
+            and not self.moe_config.is_sequence_parallel
+            and not fused_output_is_reduced
+            and fused_output.dtype == shared_output.dtype
+            and fused_output.shape[:-1] == shared_output.shape[:-1]
+        )
+
+    def _fuse_kimi_k3_latent_all_reduce(
+        self,
+        shared_output: torch.Tensor,
+        fused_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce Kimi-K3 latent and shared partials in one TP collective."""
+        latent_width = fused_output.shape[-1]
+        combined_output = torch.cat((fused_output, shared_output), dim=-1)
+        with tp_all_reduce_trace(f"moe_fused:{self.layer_name}"):
+            combined_output = tensor_model_parallel_all_reduce(combined_output)
+        return (
+            combined_output[..., :latent_width],
+            combined_output[..., latent_width:],
+        )
 
     def _maybe_reduce_final_output(
         self,
@@ -611,7 +657,8 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
         ):
-            states = tensor_model_parallel_all_reduce(states)
+            with tp_all_reduce_trace(f"moe_final:{self.layer_name}"):
+                states = tensor_model_parallel_all_reduce(states)
 
         return states[..., :trunc_size] if trunc_size is not None else states
 
@@ -967,19 +1014,31 @@ class MoERunner(MoERunnerInterface):
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
 
         fused_output_is_reduced = self._fused_output_is_reduced
-        fused_output, fused_output_is_reduced = (
-            self._maybe_reduce_routed_output_before_transform(
+        if self._can_fuse_kimi_k3_latent_all_reduce(
+            shared_output,
+            fused_output,
+            fused_output_is_reduced,
+        ):
+            assert shared_output is not None
+            fused_output, shared_output = self._fuse_kimi_k3_latent_all_reduce(
+                shared_output,
                 fused_output,
+            )
+            fused_output_is_reduced = True
+        else:
+            fused_output, fused_output_is_reduced = (
+                self._maybe_reduce_routed_output_before_transform(
+                    fused_output,
+                    fused_output_is_reduced,
+                )
+            )
+
+            # If routed output is reduced before its nonlinear transform,
+            # reduce shared output separately so both branches share a TP domain.
+            shared_output = self._maybe_reduce_shared_expert_output(
+                shared_output,
                 fused_output_is_reduced,
             )
-        )
-
-        # If routed output is reduced before its nonlinear transform, reduce
-        # shared output separately so both branches are in the same TP domain.
-        shared_output = self._maybe_reduce_shared_expert_output(
-            shared_output,
-            fused_output_is_reduced,
-        )
 
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output

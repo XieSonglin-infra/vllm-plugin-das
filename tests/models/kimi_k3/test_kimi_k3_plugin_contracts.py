@@ -1,5 +1,7 @@
 """CPU-level contracts for the HCU-owned Kimi-K3 plugin surface."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -11,6 +13,7 @@ from vllm_hcu.patch.worker.core_fix import patch_kimi_k3_model
 from vllm_hcu.models.kimi_k3.amd.ops.situ import SituAndMul
 from vllm_hcu.model_executor.layers.quantization.kimi_k3_w4a8 import (
     KIMI_K3_W4A8_PACKING,
+    KimiK3W4A8MoEMethod,
     pack_int4_twos_complement,
     unpack_int4_twos_complement,
     validate_kimi_k3_w4a8_metadata,
@@ -18,6 +21,111 @@ from vllm_hcu.model_executor.layers.quantization.kimi_k3_w4a8 import (
 from vllm_hcu.model_executor.layers.quantization.slimquant_facade import (
     KimiK3W4A8Facade,
 )
+
+
+def _ht_moe_config(ht=True, ll=False):
+    return SimpleNamespace(
+        activation=SimpleNamespace(value="situ"), swiglu_beta=None,
+        moe_parallel_config=SimpleNamespace(
+            use_deepep_ht_kernels=ht, use_deepep_ll_kernels=ll),
+    )
+
+
+def test_kimi_ht_ll_selection_rejects_ambiguous_backend():
+    with pytest.raises(ValueError, match="simultaneously"):
+        KimiK3W4A8MoEMethod(_ht_moe_config(ll=True))
+
+
+def test_kimi_ht_quant_config_uses_int8_token_scales_and_high_nibble_compensation():
+    method = KimiK3W4A8MoEMethod(_ht_moe_config())
+    layer = SimpleNamespace(w13_weight_scale=torch.ones(2, 64, 1),
+                            w2_weight_scale=torch.ones(2, 32, 1))
+    quant = method.get_fused_moe_quant_config(layer)
+    assert quant is not None
+    assert quant.quant_dtype == torch.int8
+    assert quant.per_act_token_quant
+    assert torch.equal(quant.w1_scale, layer.w13_weight_scale * 16)
+    assert torch.equal(quant.w2_scale, layer.w2_weight_scale * 16)
+    assert torch.equal(layer.w13_weight_scale, torch.ones(2, 64, 1))
+
+
+def test_kimi_ht_cannot_fall_back_to_direct_aiter_apply():
+    method = KimiK3W4A8MoEMethod(_ht_moe_config())
+    with pytest.raises(RuntimeError, match="modular"):
+        method.apply(None, None, None, None, None, None)
+
+
+def test_kimi_feature_off_has_no_modular_quant_config():
+    method = KimiK3W4A8MoEMethod(_ht_moe_config(ht=False))
+    assert method.get_fused_moe_quant_config(None) is None
+
+
+def test_kimi_ht_situ_quantization_preserves_source_parameters():
+    from vllm_hcu.model_executor.layers.quantization.kimi_k3_ht_runtime import (
+        KimiK3HTExperts,
+    )
+    expert = object.__new__(KimiK3HTExperts)
+    expert._situ_beta, expert._situ_linear_beta = 1.25, 2.0
+    calls = []
+    result = (object(), object())
+    expert._situ_quant = lambda x, **kw: (calls.append((x, kw)) or result)
+    gateup = object()
+    assert expert._quantize_activation(gateup, None, None) is result
+    assert calls == [(gateup, {"beta": 1.25, "linear_beta": 2.0})]
+    assert expert._permute_scale_kwargs(3584) == {"block_size": 3584}
+    assert expert.adjust_N_for_activation(2048, "situ") == 1024
+    with pytest.raises(ValueError, match="SiTU"):
+        expert._validate_activation("silu")
+
+
+def test_kimi_ht_rejects_batched_expert_format():
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEActivationFormat,
+    )
+    method = KimiK3W4A8MoEMethod(_ht_moe_config())
+    pf = SimpleNamespace(activation_format=FusedMoEActivationFormat.BatchedExperts)
+    with pytest.raises(ValueError, match="Standard"):
+        method.select_gemm_impl(pf, None)
+
+
+def test_kimi_ht_selects_contiguous_expert_and_binds_loaded_weights(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEActivationFormat,
+    )
+    from vllm_hcu.model_executor.layers.quantization import kimi_k3_ht_runtime
+
+    calls = []
+
+    class Expert:
+        def __init__(self, moe, quant):
+            calls.append((moe, quant))
+
+        def process_weights_after_loading(self, layer):
+            calls.append(layer)
+
+    monkeypatch.setattr(kimi_k3_ht_runtime, "KimiK3HTExperts", Expert)
+    method = KimiK3W4A8MoEMethod(_ht_moe_config())
+    method.moe_quant_config = object()
+    layer = object()
+    pf = SimpleNamespace(activation_format=FusedMoEActivationFormat.Standard)
+    assert isinstance(method.select_gemm_impl(pf, layer), Expert)
+    assert calls == [(method.moe, method.moe_quant_config), layer]
+
+
+def test_kimi_ht_missing_situ_api_fails_before_weight_packing(monkeypatch):
+    monkeypatch.setenv("VLLM_HCU_KIMI_HT_SITU_BACKEND", "lightop")
+    import sys
+    from vllm_hcu.model_executor.layers.quantization.kimi_k3_ht_runtime import (
+        KimiK3HTExperts, DeepEPDeepGemmW4A8ContiguousExperts,
+    )
+    monkeypatch.setattr(DeepEPDeepGemmW4A8ContiguousExperts, "__init__",
+                        lambda *args: None)
+    monkeypatch.setitem(sys.modules, "lightop", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "lightop.activation", SimpleNamespace())
+    config = SimpleNamespace(activation_situ_beta=1.0,
+                             activation_situ_linear_beta=2.0)
+    with pytest.raises(ImportError, match="fuse_situ_mul_quant"):
+        KimiK3HTExperts(config, None)
 
 
 def test_kimi_k3_w4a8_nibble_round_trip():

@@ -17,6 +17,19 @@ class SituAndMul(nn.Module):
         self.linear_beta = None if linear_beta is None else float(linear_beta)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda and x.is_contiguous() and x.numel() > 0:
+            from bolt_ops.fused_moe.triton.moe_activation import (
+                triton_situ_and_mul,
+            )
+
+            output = torch.empty(
+                (*x.shape[:-1], x.shape[-1] // 2),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            triton_situ_and_mul(output, x, self.beta, self.linear_beta)
+            return output
+
         gate, up = x.chunk(2, dim=-1)
         gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
         if self.linear_beta is not None:

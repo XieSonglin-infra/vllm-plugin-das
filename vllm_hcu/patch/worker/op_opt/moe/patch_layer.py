@@ -199,6 +199,9 @@ def apply_to_module(module: ModuleType) -> bool:
                 is_gated=True,
                 custom_op_name="situ_and_mul",
             )
+            # RoutedExperts snapshots activation in its constructor; the
+            # modular forward reads that snapshot, not moe_config again.
+            runner.routed_experts.activation = runner.moe_config.activation
         if situ_beta is not None:
             runner.moe_config.activation_situ_beta = situ_beta
         if situ_linear_beta is not None:

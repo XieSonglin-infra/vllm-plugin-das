@@ -1750,6 +1750,8 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     class Runner:
         def __init__(self, apply_router_weight_on_input=False):
             self.routed_experts = RoutedExperts(apply_router_weight_on_input)
+            self.moe_config = SimpleNamespace(activation="silu")
+            self.routed_experts.activation = "silu"
             self.replaced = None
 
         def _replace_quant_method(self, method):
@@ -1819,6 +1821,11 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     )
     assert fused_moe_package.FusedMoE is layer_module.FusedMoE
     runner = fused_moe_package.FusedMoE()
+    situ_runner = fused_moe_package.FusedMoE(
+        activation="situ", activation_situ_beta=4., activation_situ_linear_beta=25.,
+    )
+    assert situ_runner.routed_experts.activation is situ_runner.moe_config.activation
+    assert situ_runner.routed_experts.activation.value == "situ"
     experts = runner.routed_experts
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"
