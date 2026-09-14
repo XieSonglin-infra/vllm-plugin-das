@@ -738,8 +738,7 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
         self.use_deepep_ll = bool(getattr(parallel, "use_deepep_ll_kernels", False))
         if self.use_deepep_ht and self.use_deepep_ll:
             raise ValueError("Kimi-K3 cannot enable DeepEP HT and LL simultaneously")
-        if self.use_deepep_ll:
-            raise NotImplementedError("Kimi-K3 plugin DeepEP LL is not implemented")
+        self._hcu_kimi_ll_graph_boundary = self.use_deepep_ll
 
     def create_weights(self, layer: RoutedExperts, num_experts: int, hidden_size: int,
                        intermediate_size_per_partition: int, params_dtype: torch.dtype,
@@ -788,7 +787,7 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
         with x16 at its own call site.
         """
 
-        if self.use_deepep_ht:
+        if self.use_deepep_ht or self.use_deepep_ll:
             # Preserve canonical packed parameters for the loader. The HT
             # expert owns the one-shot HIPC cache, bound by select_gemm_impl.
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
@@ -812,12 +811,21 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
         }
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig | None:
-        if self.use_deepep_ht:
+        if self.use_deepep_ht or self.use_deepep_ll:
             return FusedMoEQuantConfig.make(
                 torch.int8, weight_dtype="int4", per_act_token_quant=True,
-                per_out_ch_quant=False, block_shape=None,
-                w1_scale=layer.w13_weight_scale * 16.0,
-                w2_scale=layer.w2_weight_scale * 16.0,
+                per_out_ch_quant=False,
+                block_shape=[256, 256] if self.use_deepep_ll else None,
+                w1_scale=(
+                    layer.w13_weight_scale
+                    if self.use_deepep_ll
+                    else layer.w13_weight_scale * 16.0
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale
+                    if self.use_deepep_ll
+                    else layer.w2_weight_scale * 16.0
+                ),
                 a1_scale=None, a2_scale=None,
             )
         return None
@@ -826,12 +834,34 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
         from vllm.model_executor.layers.fused_moe.modular_kernel import (
             FusedMoEActivationFormat,
         )
-        if not self.use_deepep_ht or (
-            prepare_finalize.activation_format != FusedMoEActivationFormat.Standard
+        expected_format = (
+            FusedMoEActivationFormat.BatchedExperts
+            if self.use_deepep_ll
+            else FusedMoEActivationFormat.Standard
+        )
+        if not (self.use_deepep_ht or self.use_deepep_ll) or (
+            prepare_finalize.activation_format != expected_format
         ):
-            raise ValueError("Kimi-K3 HT requires Standard contiguous experts")
+            raise ValueError("Kimi-K3 DeepEP selected an incompatible expert format")
         if self.moe_quant_config is None:
             raise RuntimeError("Kimi-K3 HT requires quant config before expert selection")
+        if self.use_deepep_ll:
+            from .kimi_k3_ll_runtime import KimiK3LLExperts
+
+            experts = KimiK3LLExperts(
+                self.moe,
+                self.moe_quant_config,
+                prepare_finalize.max_num_tokens_per_rank(),
+                prepare_finalize.num_dispatchers(),
+            )
+            experts.process_weights_after_loading(layer)
+            # Explicit LL selection owns a fixed-layout, LL-only buffer: no HT
+            # dispatch can dirty it between calls. Keep initial cleanup but
+            # avoid resetting it before every layer on every decode step.
+            prepare_finalize._vllm_hcu_clean_low_latency_buffer = False
+            prepare_finalize._hcu_ll_cleaned_buffer_layout = None
+            return experts
+
         from .kimi_k3_ht_runtime import KimiK3HTExperts
 
         experts = KimiK3HTExperts(self.moe, self.moe_quant_config)
@@ -841,8 +871,8 @@ class KimiK3W4A8MoEMethod(FusedMoEMethodBase):
     def apply(self, layer: RoutedExperts, x: torch.Tensor,
               topk_weights: torch.Tensor, topk_ids: torch.Tensor,
               shared_experts, shared_experts_input: torch.Tensor | None) -> torch.Tensor:
-        if self.use_deepep_ht:
-            raise RuntimeError("Kimi-K3 HT requires the modular DeepGEMM expert path")
+        if self.use_deepep_ht or self.use_deepep_ll:
+            raise RuntimeError("Kimi-K3 DeepEP requires the modular DeepGEMM expert path")
         beta = layer.moe_config.activation_situ_beta
         if beta is None:
             raise ValueError("Kimi-K3 W4A8 requires activation_situ_beta.")

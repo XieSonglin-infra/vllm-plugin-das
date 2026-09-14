@@ -357,12 +357,14 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
         "hidden": 7168,
         "num_ranks": 8,
         "num_experts": 256,
+        "num_topk": 8,
     }
     assert calls[-1] == {
         "num_max_dispatch_tokens_per_rank": 32,
         "hidden": 7168,
         "num_ranks": 8,
         "num_experts": 256,
+        "num_topk": 8,
     }
     assert kwargs == {
         "group": "group",
@@ -383,6 +385,28 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
         num_local_experts=32,
     ) == kwargs
     assert len(calls) == 32
+
+
+def test_deep_ep_low_latency_hint_tracks_model_topk(monkeypatch):
+    calls = []
+
+    class Buffer:
+        @staticmethod
+        def get_low_latency_rdma_size_hint(**kwargs):
+            calls.append(kwargs)
+            return kwargs['num_max_dispatch_tokens_per_rank'] * kwargs['num_topk']
+
+    monkeypatch.setitem(sys.modules, 'deep_ep', SimpleNamespace(Buffer=Buffer))
+    module = _fake_all2all_module()
+    patch_all2all.apply_to_module(module)
+    manager = module.DeepEPLLAll2AllManager('group', 'tcp')
+    manager._vllm_hcu_ll_num_topk = 16
+    kwargs = manager._make_all2all_kwargs(4, 3584, 8, 896, 112)
+    assert kwargs['num_rdma_bytes'] == 64
+    assert all(call['num_topk'] == 16 for call in calls)
+    manager._vllm_hcu_ll_num_topk = 8
+    assert manager._make_all2all_kwargs(4, 3584, 8, 896, 112)['num_rdma_bytes'] == 32
+    assert len(calls) == 8
 
 
 def test_deep_ep_low_latency_rejects_first_invalid_model_specific_hint(
@@ -448,6 +472,7 @@ def test_deep_ep_low_latency_rejects_first_invalid_model_specific_hint(
         "hidden": 256,
         "num_ranks": 2,
         "num_experts": 16,
+        "num_topk": 8,
     }
     assert manager._make_all2all_kwargs(
         max_num_tokens_per_dp_rank=512,

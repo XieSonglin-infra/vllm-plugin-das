@@ -25,8 +25,8 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm_hcu.platforms import envs as henvs
-from vllm.model_executor.layers.fla.ops.kda import (
-    FusedRMSNormGated,
+from vllm_hcu.models.kimi_k3.amd.ops.kda_gated_norm import (
+    KimiFusedRMSNormGated as FusedRMSNormGated,
 )
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata

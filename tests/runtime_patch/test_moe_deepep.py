@@ -148,11 +148,13 @@ def test_all2all_dispatch_selection_contract():
         return hidden_size
 
     fp8_dtype = torch.float8_e4m3fn
+    manager = SimpleNamespace()
     module = _module(
         patch_all2all_utils.TARGET_MODULE,
         torch=torch,
         current_platform=SimpleNamespace(fp8_dtype=lambda: fp8_dtype),
         DeepEPLLPrepareAndFinalize=DeepEPLLPrepareAndFinalize,
+        get_ep_all2all_manager=lambda eep_stage: manager,
         maybe_make_prepare_finalize=maybe_make_prepare_finalize,
         maybe_roundup_layer_hidden_size=maybe_roundup_layer_hidden_size,
     )
@@ -161,7 +163,9 @@ def test_all2all_dispatch_selection_contract():
 
     fp8_config = SimpleNamespace(quant_dtype=fp8_dtype)
     moe = SimpleNamespace(
-        moe_parallel_config=SimpleNamespace(use_deepep_auto_kernels=False)
+        moe_parallel_config=SimpleNamespace(use_deepep_auto_kernels=False,
+                                           use_deepep_ll_kernels=True),
+        experts_per_token=16,
     )
     result = module.maybe_make_prepare_finalize(moe, fp8_config)
     assert result is prepare_finalize
@@ -172,6 +176,7 @@ def test_all2all_dispatch_selection_contract():
     result = module.maybe_make_prepare_finalize(moe, int8_config)
     assert result.use_fp8_dispatch is False
     assert result.use_int8_dispatch is True
+    assert manager._vllm_hcu_ll_num_topk == 16
 
 
 @pytest.mark.parametrize(
@@ -4718,6 +4723,23 @@ def test_deepep_ll_hcu_int8_dispatch_contract(
         ]
     else:
         assert calls["order"] == expected_dispatches
+
+    # Only explicit LL-only ownership can reuse a clean layout. A layout or
+    # buffer change must clean again; other models keep the behavior above.
+    instance._vllm_hcu_clean_low_latency_buffer = False
+    instance._hcu_ll_cleaned_buffer_layout = None
+    calls["order"].clear()
+    for _ in range(2):
+        instance.prepare_async(hidden, topk_weights, topk_ids, 1, None, False, quant_config)
+    assert calls["order"] == [
+        ("clean", (8, 2048, 1, 0)), ("dispatch", 1), ("dispatch", 1)
+    ]
+    instance.max_tokens_per_rank = 16
+    instance.prepare_async(hidden, topk_weights, topk_ids, 1, None, False, quant_config)
+    assert calls["order"][-2:] == [("clean", (16, 2048, 1, 0)), ("dispatch", 1)]
+    instance.buffer = Buffer()
+    instance.prepare_async(hidden, topk_weights, topk_ids, 1, None, False, quant_config)
+    assert calls["order"][-2:] == [("clean", (16, 2048, 1, 0)), ("dispatch", 1)]
 
     fp8_instance = cls(None, 8, 1, use_fp8_dispatch=True)
     fp8_instance.use_int8_dispatch = False

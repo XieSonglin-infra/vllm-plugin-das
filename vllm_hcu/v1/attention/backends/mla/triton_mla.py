@@ -61,10 +61,10 @@ class HcuTritonMLAImpl(TritonMLAImpl):
         dm = attn_metadata.decode
         bt = dm.block_table
         sl = dm.seq_lens
-        qq = torch.cat(q, dim=-1) if isinstance(q, tuple) else q
         cap_payload = None
         if _TRITON_CAPTURE_DIR:
             try:
+                qq = torch.cat(q, dim=-1) if isinstance(q, tuple) else q
                 Bq = qq.shape[0]
                 rows = []
                 for i in range(Bq):

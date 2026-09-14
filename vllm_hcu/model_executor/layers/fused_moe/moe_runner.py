@@ -59,6 +59,10 @@ from vllm.utils.torch_utils import (
     LayerName,
     direct_register_custom_op,
 )
+from vllm_hcu.model_executor.layers.quantization.kimi_k3_graph_runtime import (
+    kimi_ll_graph_boundary,
+    uses_kimi_ll_graph_boundary,
+)
 from vllm_hcu.model_executor.layers.tp_allreduce_trace import tp_all_reduce_trace
 
 logger = init_logger(__name__)
@@ -122,6 +126,7 @@ def _resolve_layer_name(layer_name: str | LayerName) -> str:
 # the runner's '_forward_impl' method.
 # These functions should never be called directly since they do not
 # include all the functionality of the MoE layer.
+@kimi_ll_graph_boundary
 def _moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor | None,
@@ -168,6 +173,7 @@ def _moe_forward_fake(
     return torch.empty_like(hidden_states)
 
 
+@kimi_ll_graph_boundary
 def _moe_forward_shared(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor | None,
