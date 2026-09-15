@@ -1521,14 +1521,28 @@ def test_proposer_sidecar_init_cplb_fix_rocm_preservation_and_custom_sp_padding(
     assert prepared.num_kv_actual_tokens == 5
 
 
-def test_proposer_registers_hcu_spec_decode_metadata_once() -> None:
+def test_proposer_registers_hcu_spec_decode_metadata_once(monkeypatch) -> None:
+    import builtins
+
+    original_import = builtins.__import__
+
+    def reject_kernel_import(name, *args, **kwargs):
+        if name == "flash_attn" or name in {
+            "vllm_hcu.v1.attention.backends.flash_attn",
+            "vllm_hcu.v1.attention.backends.fa_utils",
+        }:
+            raise AssertionError("metadata registration imported optional FA kernels")
+        return original_import(name, *args, **kwargs)
+
     from vllm.v1.attention.backends.mla.flashmla_sparse import (
         FlashMLASparseMetadata,
     )
     from vllm_hcu.v1.spec_decode import proposer_runtime
-    from vllm_hcu.v1.attention.backends.flash_attn import (
+    from vllm_hcu.v1.attention.backends.flash_attn_metadata import (
         FlashAttentionMetadata,
     )
+
+    monkeypatch.setattr(builtins, "__import__", reject_kernel_import)
 
     proposer = SimpleNamespace(allowed_attn_types=(str,))
     config = _proposer_config()
@@ -1600,7 +1614,7 @@ def test_proposer_allows_triton_fallback_when_flash_attn_is_missing(
     assert proposer.allowed_attn_types[0] is str
 
 
-def test_proposer_propagates_flash_attention_symbol_errors(
+def test_proposer_propagates_flash_attention_metadata_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import builtins
@@ -1610,8 +1624,8 @@ def test_proposer_propagates_flash_attention_symbol_errors(
     original_import = builtins.__import__
 
     def import_with_incompatible_flash_attention(name, *args, **kwargs):
-        if name == "vllm_hcu.v1.attention.backends.flash_attn":
-            raise ImportError("cannot import name 'hg_flash_attn_varlen_func'")
+        if name == "vllm_hcu.v1.attention.backends.flash_attn_metadata":
+            raise ImportError("cannot import name 'FlashAttentionMetadata'")
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(
@@ -1620,7 +1634,7 @@ def test_proposer_propagates_flash_attention_symbol_errors(
         import_with_incompatible_flash_attention,
     )
 
-    with pytest.raises(ImportError, match="hg_flash_attn_varlen_func"):
+    with pytest.raises(ImportError, match="FlashAttentionMetadata"):
         proposer_runtime.initialize_proposer(
             SimpleNamespace(),
             SimpleNamespace(allowed_attn_types=(str,)),

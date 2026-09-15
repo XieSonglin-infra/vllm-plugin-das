@@ -538,7 +538,7 @@ def test_compiled_forward_keeps_inplace_entry_without_extra_routed_clone(
     torch.nn.Module.__init__(runner)
     runner.moe_config = SimpleNamespace(hidden_dim_unpadded=2)
     runner.routed_experts = SimpleNamespace(
-        quant_method=SimpleNamespace(has_unpadded_output=False),
+        quant_method=SimpleNamespace(has_unpadded_output=False, moe_kernel=None),
     )
     runner.routed_input_transform = None
     runner.routed_output_transform = None
@@ -567,12 +567,12 @@ def test_compiled_forward_keeps_inplace_entry_without_extra_routed_clone(
     monkeypatch.setattr(
         moe_runner_module.MoERunner,
         "_maybe_reduce_shared_expert_output",
-        lambda self, shared: shared,
+        lambda self, shared, fused_output_is_reduced=None: shared,
     )
     monkeypatch.setattr(
         moe_runner_module.MoERunner,
         "_maybe_reduce_final_output",
-        lambda self, output, _truncate: output,
+        lambda self, output, _truncate, output_is_reduced=None: output,
     )
     monkeypatch.setattr(
         moe_runner_module.MoERunner,

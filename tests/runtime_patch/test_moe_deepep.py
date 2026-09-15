@@ -4741,6 +4741,17 @@ def test_deepep_ll_hcu_int8_dispatch_contract(
     instance.prepare_async(hidden, topk_weights, topk_ids, 1, None, False, quant_config)
     assert calls["order"][-2:] == [("clean", (16, 2048, 1, 0)), ("dispatch", 1)]
 
+    # Upstream's dynamic HT/LL policy stays authoritative even when a cached
+    # clean layout is present; an HT dispatch may have dirtied its counters.
+    instance._vllm_hcu_clean_low_latency_buffer = True
+    calls["order"].clear()
+    for _ in range(2):
+        instance.prepare_async(hidden, topk_weights, topk_ids, 1, None, False, quant_config)
+    assert calls["order"] == [
+        ("clean", (16, 2048, 1, 0)), ("dispatch", 1),
+        ("clean", (16, 2048, 1, 0)), ("dispatch", 1),
+    ]
+
     fp8_instance = cls(None, 8, 1, use_fp8_dispatch=True)
     fp8_instance.use_int8_dispatch = False
     fp8_values = torch.ones((1, 2, 4), dtype=torch.float8_e4m3fn)

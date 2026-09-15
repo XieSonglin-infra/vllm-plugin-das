@@ -137,7 +137,8 @@ def test_kimi_ll_selects_masked_expert_and_binds_weights(monkeypatch):
     )
     assert isinstance(method.select_gemm_impl(pf, layer), Expert)
     assert calls == [(method.moe, method.moe_quant_config, 8, 2), layer]
-    assert pf._hcu_ll_dedicated_buffer is True
+    assert pf._vllm_hcu_clean_low_latency_buffer is False
+    assert pf._hcu_ll_cleaned_buffer_layout is None
 
 
 def test_kimi_ht_cannot_fall_back_to_direct_aiter_apply():

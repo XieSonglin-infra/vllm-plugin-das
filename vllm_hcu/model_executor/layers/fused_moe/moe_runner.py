@@ -61,7 +61,6 @@ from vllm.utils.torch_utils import (
 )
 from vllm_hcu.model_executor.layers.quantization.kimi_k3_graph_runtime import (
     kimi_ll_graph_boundary,
-    uses_kimi_ll_graph_boundary,
 )
 from vllm_hcu.model_executor.layers.tp_allreduce_trace import tp_all_reduce_trace
 

@@ -2364,6 +2364,9 @@ def test_mla_attention_wrapper_preserves_short_extend_policy():
         def process_weights_after_loading(self, act_dtype):
             pass
 
+        def get_kv_cache_spec(self, vllm_config):
+            return None
+
     class MLACommonMetadata:
         def __init__(self, num_actual_tokens):
             self.num_actual_tokens = num_actual_tokens
