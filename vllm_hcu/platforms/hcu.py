@@ -151,25 +151,9 @@ def _get_backend_priorities(
         ]
 
     if use_mla:
-        # Keep the source/reference decode path as the default.  The old
-        # unconditional FLASHMLA-first order made
-        # VLLM_HCU_USE_FLASHMLA=0 ineffective: FLASHMLA was still selected
-        # whenever its configuration validated, introducing the HCU
-        # split-KV metadata/combine kernels in decode.  Opt into that path
-        # explicitly with VLLM_HCU_USE_FLASHMLA=1.
-        if henvs.VLLM_HCU_USE_FLASHMLA and henvs.VLLM_HCU_FORCE_FLASHMLA:
-            return [
-                AttentionBackendEnum.FLASHMLA,
-                AttentionBackendEnum.TRITON_MLA,
-            ]
-        if henvs.VLLM_HCU_USE_FLASHMLA:
-            logger.warning(
-                "[HCU FLASHMLA]: decode safety fallback to TRITON_MLA; "
-                "set VLLM_HCU_FORCE_FLASHMLA=1 to run raw FlashMLA decode"
-            )
         return [
-            AttentionBackendEnum.TRITON_MLA,
             AttentionBackendEnum.FLASHMLA,
+            AttentionBackendEnum.TRITON_MLA,
         ]
     return [
         AttentionBackendEnum.FLASH_ATTN,
@@ -425,8 +409,7 @@ class HCUPlatform(Platform):
     
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # Match the standard ROCm path by default. The HCU P2P implementation
-        # changes the TP collective backend and is only enabled explicitly.
+        # Enable HCU P2P by default, with an explicit RCCL/NCCL opt-out.
         return henvs.VLLM_HCU_USE_CUSTOM_ALLREDUCE
 
     @classmethod

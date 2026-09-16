@@ -62,7 +62,6 @@ from vllm.utils.torch_utils import (
 from vllm_hcu.model_executor.layers.quantization.kimi_k3_graph_runtime import (
     kimi_ll_graph_boundary,
 )
-from vllm_hcu.model_executor.layers.tp_allreduce_trace import tp_all_reduce_trace
 
 logger = init_logger(__name__)
 
@@ -567,8 +566,7 @@ class MoERunner(MoERunnerInterface):
             and not self.moe_config.is_sequence_parallel
             and fused_output_is_reduced
         ):
-            with tp_all_reduce_trace(f"moe_shared:{self.layer_name}"):
-                shared_output = tensor_model_parallel_all_reduce(shared_output)
+            shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
 
     def _maybe_reduce_routed_output_before_transform(
@@ -583,8 +581,7 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not fused_output_is_reduced
         ):
-            with tp_all_reduce_trace(f"moe_routed:{self.layer_name}"):
-                fused_output = tensor_model_parallel_all_reduce(fused_output)
+            fused_output = tensor_model_parallel_all_reduce(fused_output)
             fused_output_is_reduced = True
         return fused_output, fused_output_is_reduced
 
@@ -594,10 +591,10 @@ class MoERunner(MoERunnerInterface):
         fused_output: torch.Tensor,
         fused_output_is_reduced: bool,
     ) -> bool:
-        """Whether Kimi-K3 can reduce its latent and shared partials together."""
+        """Fuse eligible Kimi-K3 partials by default; the env flag can opt out."""
         fusion_enabled = os.environ.get(
             "VLLM_HCU_KIMI_LATENT_MOE_FUSE_ALLREDUCE",
-            "0",
+            "1",
         ).lower() in ("true", "1")
         return (
             fusion_enabled
@@ -623,8 +620,7 @@ class MoERunner(MoERunnerInterface):
         """Reduce Kimi-K3 latent and shared partials in one TP collective."""
         latent_width = fused_output.shape[-1]
         combined_output = torch.cat((fused_output, shared_output), dim=-1)
-        with tp_all_reduce_trace(f"moe_fused:{self.layer_name}"):
-            combined_output = tensor_model_parallel_all_reduce(combined_output)
+        combined_output = tensor_model_parallel_all_reduce(combined_output)
         return (
             combined_output[..., :latent_width],
             combined_output[..., latent_width:],
@@ -662,8 +658,7 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
         ):
-            with tp_all_reduce_trace(f"moe_final:{self.layer_name}"):
-                states = tensor_model_parallel_all_reduce(states)
+            states = tensor_model_parallel_all_reduce(states)
 
         return states[..., :trunc_size] if trunc_size is not None else states
 

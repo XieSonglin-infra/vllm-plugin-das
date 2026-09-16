@@ -960,6 +960,13 @@ def test_kimi_k3_latent_fuses_shared_and_routed_all_reduces(
     fused_output = torch.tensor([[1.0, 2.0]])
     shared_output = torch.tensor([[3.0, 4.0, 5.0]])
 
+    monkeypatch.delenv("VLLM_HCU_KIMI_LATENT_MOE_FUSE_ALLREDUCE", raising=False)
+    assert runner._can_fuse_kimi_k3_latent_all_reduce(
+        shared_output,
+        fused_output,
+        False,
+    )
+    monkeypatch.setenv("VLLM_HCU_KIMI_LATENT_MOE_FUSE_ALLREDUCE", "0")
     assert not runner._can_fuse_kimi_k3_latent_all_reduce(
         shared_output,
         fused_output,

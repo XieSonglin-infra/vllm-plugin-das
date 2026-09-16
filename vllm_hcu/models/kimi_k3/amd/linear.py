@@ -64,7 +64,6 @@ from vllm.model_executor.models.utils import (
 )
 from bolt_ops.generic import attn_res
 from vllm.sequence import IntermediateTensors
-from vllm_hcu.models.kimi_k3.activation_trace import KimiActivationTrace
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 
@@ -588,7 +587,6 @@ class KimiDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
-        self._activation_trace = None
 
         self.is_moe = config.is_moe
         layer_idx = self.layer_idx
@@ -708,9 +706,6 @@ class KimiDecoderLayer(nn.Module):
             assert residual is not None
             return self.forward_attn_residual(positions, hidden_states, residual)
 
-        if self._activation_trace is not None:
-            self._activation_trace.capture("layer_input_residual", residual, self.layer_idx)
-
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -718,20 +713,10 @@ class KimiDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if self._activation_trace is not None:
-            self._activation_trace.capture("input_norm_residual_after", residual, self.layer_idx)
-
         hidden_states = self._run_self_attn(positions, hidden_states)
-        if self._activation_trace is not None:
-            self._activation_trace.capture("self_attn_output", hidden_states, self.layer_idx)
-
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        if self._activation_trace is not None:
-            self._activation_trace.capture("post_attention_norm_residual_after", residual, self.layer_idx)
         hidden_states = self.mlp(hidden_states)
-        if self._activation_trace is not None:
-            self._activation_trace.capture("mlp_output", hidden_states, self.layer_idx)
         return hidden_states, residual
 
     def forward_attn_residual(
@@ -755,9 +740,6 @@ class KimiDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self._run_self_attn(positions, hidden_states)
-        if self._activation_trace is not None:
-            self._activation_trace.capture("self_attn_output", hidden_states, self.layer_idx)
-
         if prefix_sum is not None:
             prefix_sum = prefix_sum + hidden_states
         else:
@@ -776,8 +758,6 @@ class KimiDecoderLayer(nn.Module):
 
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if self._activation_trace is not None:
-            self._activation_trace.capture("mlp_output", hidden_states, self.layer_idx)
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, block_residual
 
@@ -812,164 +792,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             get_layer,
             prefix=f"{prefix}.layers",
         )
-        self._activation_trace = KimiActivationTrace.from_env(prefix)
-        for layer in self.layers:
-            layer._activation_trace = self._activation_trace
-            if self._activation_trace is not None:
-                layer.register_forward_pre_hook(
-                    lambda module, args, kwargs, idx=layer.layer_idx: self._activation_trace.capture(
-                        "layer_input_residual",
-                        args[2] if len(args) > 2 else kwargs.get("residual"),
-                        idx,
-                    ),
-                    with_kwargs=True,
-                )
-            if self._activation_trace is not None and hasattr(layer, "post_attention_layernorm"):
-                layer.post_attention_layernorm.register_forward_hook(
-                    lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
-                        "post_attention_norm_output",
-                        output[0] if isinstance(output, tuple) else output,
-                        idx,
-                    )
-                )
-            if self._activation_trace is not None and hasattr(layer, "input_layernorm"):
-                layer.input_layernorm.register_forward_hook(
-                    lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
-                        "input_norm_residual",
-                        output[1] if isinstance(output, tuple) and len(output) > 1 else torch.empty(0),
-                        idx,
-                    )
-                )
-                layer.input_layernorm.register_forward_hook(
-                    lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
-                        "input_norm_output",
-                        output[0] if isinstance(output, tuple) else output,
-                        idx,
-                    )
-                )
-            if self._activation_trace is not None and hasattr(layer, "post_attention_layernorm"):
-                layer.post_attention_layernorm.register_forward_hook(
-                    lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
-                        "post_attention_norm_residual",
-                        output[1] if isinstance(output, tuple) and len(output) > 1 else torch.empty(0),
-                        idx,
-                    )
-                )
-            if self._activation_trace is not None and hasattr(layer.mlp, "gate"):
-                layer.mlp.gate.register_forward_pre_hook(
-                    lambda module, args, idx=layer.layer_idx: self._activation_trace.capture(
-                        "moe_gate_input",
-                        args[0] if args else torch.empty(0),
-                        idx,
-                    )
-                )
-                layer.mlp.gate.register_forward_hook(
-                    lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
-                        "moe_router_logits",
-                        output[0] if isinstance(output, tuple) else output,
-                        idx,
-                    )
-                )
-            if self._activation_trace is not None:
-                # Capture the shared projection boundaries for both KDA and MLA.
-                # Absent modules are skipped because layer types expose different APIs.
-                for module_name in (
-                    "in_proj_qkvgfab",
-                    "g_a_proj",
-                    "g_b_proj",
-                    "f_b_proj",
-                    "conv1d",
-                    "o_norm",
-                    "fused_qkv_a_proj",
-                    "kv_a_proj_with_mqa",
-                    "q_a_proj",
-                    "q_a_layernorm",
-                    "q_b_proj",
-                    "q_proj",
-                    "kv_a_layernorm",
-                    "kv_b_proj",
-                    "g_proj",
-                    "o_proj",
-                ):
-                    attn_module = getattr(layer.self_attn, module_name, None)
-                    if attn_module is not None and hasattr(attn_module, "register_forward_hook"):
-                        attn_module.register_forward_hook(
-                            lambda module, args, output, name=module_name, idx=layer.layer_idx: self._activation_trace.capture(
-                                f"attn_{name}",
-                                output[0] if isinstance(output, tuple) else output,
-                                idx,
-                            )
-                        )
-            if self._activation_trace is not None and getattr(layer.mlp, "shared_experts", None) is not None:
-                layer.mlp.shared_experts.register_forward_hook(
-                    lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
-                        "moe_shared_output",
-                        output[0] if isinstance(output, tuple) else output,
-                        idx,
-                    )
-                )
-            if self._activation_trace is not None:
-                runner = getattr(layer.mlp, "experts", None)
-                routed = getattr(runner, "routed_experts", None)
-                if routed is not None and not getattr(routed, "_kimi_trace_wrapped", False):
-                    original_forward_modular = routed.forward_modular
-                    trace = self._activation_trace
-                    idx = layer.layer_idx
-
-                    def traced_forward_modular(
-                        x, topk_weights, topk_ids, shared_experts=None,
-                        shared_experts_input=None, *,
-                        _trace=trace, _idx=idx,
-                        _original=original_forward_modular,
-                    ):
-                        _trace.capture("moe_routed_input", x, _idx)
-                        _trace.capture("moe_topk_weights", topk_weights, _idx)
-                        _trace.capture("moe_topk_ids", topk_ids, _idx)
-                        result = _original(
-                            x, topk_weights, topk_ids, shared_experts,
-                            shared_experts_input,
-                        )
-                        _trace.capture("moe_routed_output", result, _idx)
-                        return result
-
-                    routed.forward_modular = traced_forward_modular
-                    routed._kimi_trace_wrapped = True
-                if runner is not None and hasattr(runner, "register_forward_hook"):
-                    runner.register_forward_hook(
-                        lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
-                            "moe_runner_output",
-                            output[0] if isinstance(output, tuple) else output,
-                            idx,
-                        )
-                    )
-                    transform = getattr(runner, "routed_output_transform", None)
-                    if transform is None:
-                        transform = getattr(runner, "_routed_output_transform", None)
-                    if transform is not None and hasattr(transform, "register_forward_hook"):
-                        if getattr(transform, "norm", None) is not None and hasattr(transform.norm, "register_forward_hook"):
-                            transform.norm.register_forward_hook(
-                                lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
-                                    "moe_routed_norm_output",
-                                    output[0] if isinstance(output, tuple) else output,
-                                    idx,
-                                )
-                            )
-                        if getattr(transform, "up_proj", None) is not None and hasattr(transform.up_proj, "register_forward_hook"):
-                            transform.up_proj.register_forward_hook(
-                                lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
-                                    "moe_routed_up_proj_output",
-                                    output[0] if isinstance(output, tuple) else output,
-                                    idx,
-                                )
-                            )
-                        transform.register_forward_hook(
-                            lambda module, args, output, idx=layer.layer_idx: self._activation_trace.capture(
-                                "moe_routed_transformed_output",
-                                output[0] if isinstance(output, tuple) else output,
-                                idx,
-                            )
-                        )
-
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             if config.attn_res_block_size is not None:
@@ -1042,16 +864,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if self._activation_trace is not None:
-            self._activation_trace.begin(input_ids, positions)
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
-            if self._activation_trace is not None:
-                self._activation_trace.capture("embedding", hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1066,19 +884,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 self.layers[self.start_layer : self.end_layer],
                 start=self.start_layer,
             ):
-                if self._activation_trace is not None:
-                    self._activation_trace.capture(
-                        f"layer_{layer_idx}_input", hidden_states, layer_idx
-                    )
                 hidden_states, residual = layer(
                     positions=positions,
                     hidden_states=hidden_states,
                     residual=residual,
                 )
-                if self._activation_trace is not None:
-                    self._activation_trace.capture(
-                        f"layer_{layer_idx}_output", hidden_states, layer_idx
-                    )
                 self._maybe_add_hidden_state(
                     aux_hidden_states, layer_idx + 1, hidden_states, residual
                 )
@@ -1108,19 +918,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
         ):
-            if self._activation_trace is not None:
-                self._activation_trace.capture(
-                    f"layer_{layer_idx}_input", hidden_states, layer_idx
-                )
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
-            if self._activation_trace is not None:
-                self._activation_trace.capture(
-                    f"layer_{layer_idx}_output", hidden_states, layer_idx
-                )
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 # AMD attn-res layer already returns prefix_sum + MLP delta as
                 # hidden_states; the override drops the block bank in residual.
@@ -1401,11 +1203,7 @@ class KimiLinearForCausalLM(
         # The model's final norm is applied here (not at the end of forward) so
         # that the pre-norm hidden states can be fed to the MTP draft model.
         hidden_states = self.model.norm(hidden_states, None)
-        if self.model._activation_trace is not None:
-            self.model._activation_trace.capture("final_norm", hidden_states)
         logits = self.logits_processor(self.lm_head, hidden_states)
-        if self.model._activation_trace is not None and logits is not None:
-            self.model._activation_trace.capture("logits", logits)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

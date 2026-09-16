@@ -1664,16 +1664,34 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     assert config.cache_config.block_size == 64
 
 
-def test_hcu_defaults_match_source_decode_paths(
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mla_backend_priority_matches_v0251(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    from vllm_hcu.platforms import envs as hcu_envs
+    from vllm_hcu.platforms.hcu import _get_backend_priorities
+
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_FLASHMLA", enabled)
+    _get_backend_priorities.cache_clear()
+    try:
+        names = [backend.name for backend in _get_backend_priorities(True, False)]
+        assert names == ["FLASHMLA", "TRITON_MLA"]
+    finally:
+        _get_backend_priorities.cache_clear()
+
+
+def test_hcu_collective_switch_and_source_decode_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm_hcu.model_executor.layers.fused_moe import shared_experts
     from vllm_hcu.platforms import envs as hcu_envs
     from vllm_hcu.platforms.hcu import HCUPlatform
 
-    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_CUSTOM_ALLREDUCE", False)
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_ALLREDUCE", raising=False)
+    assert HCUPlatform.use_custom_allreduce() is True
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "0")
     assert HCUPlatform.use_custom_allreduce() is False
-    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_CUSTOM_ALLREDUCE", True)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "1")
     assert HCUPlatform.use_custom_allreduce() is True
 
     priority = HCUPlatform.get_default_ir_op_priority(SimpleNamespace())

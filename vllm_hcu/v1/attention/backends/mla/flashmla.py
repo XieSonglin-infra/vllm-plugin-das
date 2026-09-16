@@ -5,7 +5,6 @@
 
 from dataclasses import dataclass
 from typing import ClassVar
-import os
 
 import torch
 
@@ -51,40 +50,6 @@ import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 
 logger = init_logger(__name__)
-_FLASHMLA_DEBUG_DUMPED = False
-
-# ---- temporary decode-input capture (precision diagnosis, env-gated) ----
-_FLASHMLA_CAPTURE_DIR = os.environ.get("VLLM_HCU_FLASHMLA_CAPTURE_DIR", "") or None
-_FLASHMLA_CAPTURE_N = [0]
-_FLASHMLA_CAPTURE_MAX = 300
-
-
-def _flashmla_capture(payload: dict) -> None:
-    """Save one decode call's inputs + flash output under the capture dir."""
-    if not _FLASHMLA_CAPTURE_DIR:
-        return
-    try:
-        _FLASHMLA_CAPTURE_N[0] += 1
-        n = _FLASHMLA_CAPTURE_N[0]
-        if n > _FLASHMLA_CAPTURE_MAX:
-            return
-        rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "0"
-        try:
-            # Distributed workers know their global rank via the process group.
-            import torch.distributed as _dist
-
-            if _dist.is_available() and _dist.is_initialized():
-                rank = str(_dist.get_rank())
-        except Exception:
-            pass
-        path = os.path.join(
-            _FLASHMLA_CAPTURE_DIR, f"flash_decode.r{rank}.call{n:04d}.pt"
-        )
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(payload, path)
-    except Exception:  # never break inference for a diagnostic capture
-        pass
-
 
 
 class HcuFlashMLABackend(MLACommonBackend):
@@ -342,29 +307,6 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
-        global _FLASHMLA_DEBUG_DUMPED
-        if os.getenv("VLLM_HCU_FLASHMLA_DEBUG", "0") == "1" and not _FLASHMLA_DEBUG_DUMPED:
-            _FLASHMLA_DEBUG_DUMPED = True
-            sm = attn_metadata.decode.scheduler_metadata
-            q_info = (
-                [(tuple(x.shape), tuple(x.stride()), str(x.dtype), str(x.device)) for x in q]
-                if isinstance(q, tuple)
-                else (tuple(q.shape), tuple(q.stride()), str(q.dtype), str(q.device))
-            )
-            logger.warning(
-                "HCU FlashMLA debug: q=%s cache(shape=%s stride=%s dtype=%s device=%s) "
-                "block_table(shape=%s stride=%s dtype=%s) seq_lens(shape=%s stride=%s dtype=%s) "
-                "tile=%s num_splits=%s q_scale=%s k_scale=%s kv_dtype=%s",
-                q_info,
-                tuple(kv_c_and_k_pe_cache.shape), tuple(kv_c_and_k_pe_cache.stride()),
-                str(kv_c_and_k_pe_cache.dtype), str(kv_c_and_k_pe_cache.device),
-                tuple(attn_metadata.decode.block_table.shape), tuple(attn_metadata.decode.block_table.stride()),
-                str(attn_metadata.decode.block_table.dtype), tuple(attn_metadata.decode.seq_lens.shape),
-                tuple(attn_metadata.decode.seq_lens.stride()), str(attn_metadata.decode.seq_lens.dtype),
-                getattr(sm, "tile_scheduler_metadata", None), getattr(sm, "num_splits", None),
-                tuple(layer._q_scale.shape), tuple(layer._k_scale.shape), self.kv_cache_dtype,
-            )
-
         # if type(q) is tuple:
         #     q = torch.cat(q, dim=-1)
         
@@ -451,46 +393,6 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 kv_cache_dtype=self.kv_cache_dtype,
             )
         else:
-            cap_payload = None
-            if _FLASHMLA_CAPTURE_DIR:
-                try:
-                    dm = attn_metadata.decode
-                    bt = dm.block_table
-                    sl = dm.seq_lens
-                    Bq = q.shape[0]
-                    pages = [[(int(sl[i]) + 63) // 64] for i in range(Bq)]
-                    rows = []
-                    for i in range(Bq):
-                        for b in bt[i, : pages[i][0]].tolist():
-                            rows.append(kv_c_and_k_pe_cache[b].detach())
-                    cache_rows = (
-                        torch.stack(rows) if rows else kv_c_and_k_pe_cache[:0]
-                    )
-                    sm = scheduler_metadata
-                    cap_payload = {
-                        "q": q.detach(),  # (B, seq=1, heads, 576)
-                        "cache_rows": cache_rows,  # (used_blocks, 64, 576) bf16
-                        "block_table": bt.detach(),
-                        "seq_lens": sl.detach().tolist(),
-                        "num_decodes": attn_metadata.num_decodes,
-                        "cache_shape": tuple(kv_c_and_k_pe_cache.shape),
-                        "cache_data_ptr": kv_c_and_k_pe_cache.data_ptr(),
-                        "kv_dtype": self.kv_cache_dtype,
-                        "head_dim_v": self.kv_lora_rank,
-                        "scale": float(self.scale),
-                        "sm_tile": (
-                            sm.tile_scheduler_metadata.clone()
-                            if sm.tile_scheduler_metadata is not None
-                            else None
-                        ),
-                        "sm_num_splits": (
-                            sm.num_splits.clone()
-                            if sm.num_splits is not None
-                            else None
-                        ),
-                    }
-                except Exception:
-                    cap_payload = None
             o, lse = flash_mla_with_kvcache(
                 q=q,
                 k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1
@@ -502,41 +404,6 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 causal=True,
                 is_fp8_kvcache=False,
             )
-            if cap_payload is not None:
-                cap_payload["out"] = o.detach()
-                cap_payload["lse"] = lse.detach()
-                try:
-                    # In-process empty-meta recompute on the SAME live inputs:
-                    # if it matches `o`, the runtime scheduler_metadata is not
-                    # the cause; if it does NOT, scheduling differs from fresh
-                    # lazy generation.
-                    o2, _ = flash_mla_with_kvcache(
-                        q=q,
-                        k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),
-                        block_table=attn_metadata.decode.block_table,
-                        cache_seqlens=attn_metadata.decode.seq_lens,
-                        head_dim_v=self.kv_lora_rank,
-                        tile_scheduler_metadata=FlashMLASchedMeta(),
-                        softmax_scale=self.scale,
-                        causal=True,
-                        is_fp8_kvcache=False,
-                    )
-                    cap_payload["out_empty"] = o2.detach()
-                    cap_payload["out_empty_max_abs"] = float(
-                        (o.detach().float() - o2.detach().float()).abs().max().item()
-                    )
-                    # Re-read the used cache rows after the kernel(s) to detect
-                    # any mutation of the decode blocks by the kernel itself.
-                    rows2 = []
-                    for i in range(Bq):
-                        for b in bt[i, : pages[i][0]].tolist():
-                            rows2.append(kv_c_and_k_pe_cache[b].detach())
-                    cap_payload["cache_rows_post"] = (
-                        torch.stack(rows2) if rows2 else kv_c_and_k_pe_cache[:0]
-                    )
-                except Exception:
-                    pass
-                _flashmla_capture(cap_payload)
 
         o = reshape_attn_output_for_spec_decode(o)
 

@@ -9,13 +9,12 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    VLLM_USE_NN : bool = False
+    VLLM_USE_NN : bool = True
     VLLM_HCU_USE_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASH_ATTN_UNIFIED: bool = False
     VLLM_HCU_USE_FLASH_ATTN_VARLEN: bool = True
     VLLM_HCU_USE_CUSTOM_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASHMLA: bool = False
-    VLLM_HCU_FORCE_FLASHMLA: bool = False
     VLLM_USE_OPT_CAT: bool = False
     VLLM_HCU_USE_CAT_MLA: bool = False
     VLLM_HCU_DISABLE_DSA: bool = False
@@ -25,10 +24,9 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
-    VLLM_HCU_KIMI_FAKE_WEIGHT_DEBUG : bool = False
     VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
-    VLLM_HCU_USE_CUSTOM_ALLREDUCE : bool = False
+    VLLM_HCU_USE_CUSTOM_ALLREDUCE : bool = True
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE: bool = True
     VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP: bool = True
@@ -166,15 +164,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # path to the logs of redirect-output, abstrac of related are ok
 
     # If set, vLLM will transpose weight to use nn layout.
-    # Default is False so unquantized linear layers keep the source vLLM
-    # layout: weight [out_features, in_features] applied with F.linear, which
-    # makes hipBLASLt pick the Alik non-transposed-A solution. With the old
-    # True default the weight was stored [in_features, out_features] and
-    # applied with matmul(x, W), selecting the Ailk solution that splits K
-    # (GSU8/16) and adds a per-step Cijk_B_PostGSU reduce kernel on
-    # single-token decode. Set VLLM_USE_NN=1 to restore the old behaviour.
     "VLLM_USE_NN":
-    lambda: (os.environ.get("VLLM_USE_NN", "False").lower() in
+    lambda: (os.environ.get("VLLM_USE_NN", "True").lower() in
              ("true", "1")),
     # vLLM will use FlashAttention Backend on hcu, office attention layerout blocksize 128
     "VLLM_HCU_USE_FLASH_ATTN":
@@ -196,11 +187,6 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # vLLM will use FlashMLA Backend on hcu
     "VLLM_HCU_USE_FLASHMLA":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASHMLA", "False").lower() in
-             ("true", "1")),
-    # HCU gfx93 FlashMLA decode is opt-in until its split-KV numerical path
-    # matches the source-equivalent Triton MLA implementation.
-    "VLLM_HCU_FORCE_FLASHMLA":
-    lambda: (os.environ.get("VLLM_HCU_FORCE_FLASHMLA", "False").lower() in
              ("true", "1")),
     # vLLM will use use opt cat 
     "VLLM_USE_OPT_CAT":
@@ -237,19 +223,15 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_SKIP_WEIGHT_DEBUG":
     lambda: (os.environ.get("VLLM_HCU_USE_SKIP_WEIGHT_DEBUG", "False").lower() in
              ("true", "1")),
-    "VLLM_HCU_KIMI_FAKE_WEIGHT_DEBUG":
-    lambda: (os.environ.get("VLLM_HCU_KIMI_FAKE_WEIGHT_DEBUG", "False").lower() in
-             ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER", "False").lower() in
             ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_RMS_NORM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_RMS_NORM", "True").lower() in
              ("true", "1")),
-    # Keep RCCL/NCCL as the default TP collective path. The HCU P2P custom
-    # all-reduce remains available for an explicit opt-in.
+    # Enable HCU P2P custom all-reduce by default; set False to use RCCL/NCCL.
     "VLLM_HCU_USE_CUSTOM_ALLREDUCE":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "False").lower() in
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "True").lower() in
              ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_AITER_FLA":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_AITER_FLA", "True").lower() in

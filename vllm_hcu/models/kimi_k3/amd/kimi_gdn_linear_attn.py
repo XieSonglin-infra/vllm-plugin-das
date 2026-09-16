@@ -76,12 +76,11 @@ def _use_ext_causal_conv1d() -> bool:
     """Whether to dispatch Kimi KDA prefill/decode Conv1D to the external
     causal_conv1d package.
 
-    Enabled only when the environment variable VLLM_KIMI_CONV1D_BACKEND == "1".
-    Default (unset or any other value) is disabled and uses vLLM Triton.
+    Enabled by default; set VLLM_KIMI_CONV1D_BACKEND=0 to use vLLM Triton.
     spec-decode always stays on Triton because the external package lacks its
     state-update parameters.
     """
-    return os.environ.get("VLLM_KIMI_CONV1D_BACKEND") == "1"
+    return os.environ.get("VLLM_KIMI_CONV1D_BACKEND", "1") == "1"
 
 
 _EXT_CAUSAL_CONV1D_CACHE = None
@@ -115,11 +114,10 @@ def _load_ext_causal_conv1d():
 def _use_flash_kda() -> bool:
     """Whether to dispatch Kimi KDA prefill to the external flash_kda package.
 
-    Enabled only when the environment variable VLLM_KIMI_FLASHKDA_BACKEND
-    == "1" (same convention as VLLM_KIMI_CONV1D_BACKEND). Default (unset or
-    any other value) is disabled and uses the vendored Triton chunk kernels.
+    Enabled by default; set VLLM_KIMI_FLASHKDA_BACKEND=0 to use the
+    vendored Triton chunk kernels.
     """
-    return os.environ.get("VLLM_KIMI_FLASHKDA_BACKEND") == "1"
+    return os.environ.get("VLLM_KIMI_FLASHKDA_BACKEND", "1") == "1"
 
 
 _FLASH_KDA_CACHE = None
@@ -724,7 +722,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     has_initial_state,
                 )
                 # flash_kda (prebuilt HIP .so): a single fused prefill entry
-                # point, enabled via VLLM_KIMI_FLASHKDA_BACKEND=1. It applies
+                # point, enabled by default. It applies
                 # qk-l2norm internally and requires K=V=128 plus a bounded gate.
                 if (
                     _use_flash_kda()
