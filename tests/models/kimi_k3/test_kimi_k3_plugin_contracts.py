@@ -93,6 +93,37 @@ def test_kimi_ht_quant_config_uses_int8_token_scales_and_high_nibble_compensatio
     assert torch.equal(layer.w13_weight_scale, torch.ones(2, 64, 1))
 
 
+def test_kimi_ht_compensated_scales_participate_in_expert_transfer():
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.local_num_experts = 3
+    method = KimiK3W4A8MoEMethod(_ht_moe_config())
+    method.create_weights(layer, 3, 32, 32, torch.bfloat16)
+    with torch.no_grad():
+        layer.w13_weight_scale.copy_(torch.arange(1, 4).view(3, 1, 1))
+        layer.w2_weight_scale.copy_(torch.arange(4, 7).view(3, 1, 1))
+    quant = method.get_fused_moe_quant_config(layer)
+    weights = list(layer.get_expert_weights())
+    assert quant.w1_scale.data_ptr() in [w.data_ptr() for w in weights]
+    assert quant.w2_scale.data_ptr() in [w.data_ptr() for w in weights]
+    before = [w.data_ptr() for w in weights]
+    with torch.no_grad():
+        for weight in weights:
+            weight.copy_(weight[[2, 0, 1]])
+    again = method.get_fused_moe_quant_config(layer)
+    assert before == [w.data_ptr() for w in layer.get_expert_weights()]
+    assert again.w1_scale is quant.w1_scale
+    assert again.w2_scale is quant.w2_scale
+    torch.testing.assert_close(quant.w1_scale, layer.w13_weight_scale * 16, atol=0, rtol=0)
+    torch.testing.assert_close(quant.w2_scale, layer.w2_weight_scale * 16, atol=0, rtol=0)
+    assert not method.supports_eplb  # This ownership fix alone is not online EPLB.
+    layer.w13_weight_scale = torch.nn.Parameter(layer.w13_weight_scale.clone(), requires_grad=False)
+    with pytest.raises(RuntimeError, match="scales replaced"):
+        method.get_fused_moe_quant_config(layer)
+
+
 def test_kimi_ll_quant_config_keeps_scale_correction_at_masked_gemm():
     from vllm_hcu.patch.worker.op_opt.moe import patch_config
 

@@ -39,6 +39,7 @@ from vllm.config import (
     update_config,
 )
 from vllm.config.cache import CacheConfig
+from vllm.distributed import get_ep_group
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -3317,6 +3318,19 @@ class GPUModelRunner(
             {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()}
         )
 
+    def _register_eplb_model(self, load_dummy_weights: bool) -> int:
+        if not self.parallel_config.enable_eplb or load_dummy_weights:
+            return 0
+        model = self.model
+        if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
+            model = model.get_language_model()
+        if not is_mixture_of_experts(model):
+            return 0
+        logger.info_once("EPLB is enabled for model %s.", self.model_config.model)
+        assert self.eplb_state is not None
+        self.eplb_state.add_model(model, self.model_config)
+        return 1
+
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         """
         Step for the EPLB (Expert Parallelism Load Balancing) state.
@@ -3326,6 +3340,8 @@ class GPUModelRunner(
 
         assert self.eplb_state is not None
         model = self.get_model()
+        if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
+            model = model.get_language_model()
         assert is_mixture_of_experts(model)
         self.eplb_state.step(
             is_dummy,
@@ -3339,6 +3355,8 @@ class GPUModelRunner(
         old_num_physical_experts: int,
     ) -> None:
         model = self.get_model()
+        if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
+            model = model.get_language_model()
         assert is_mixture_of_experts(model)
 
         self.eplb_state = EplbState.from_mapping(
@@ -4273,6 +4291,10 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        if self.eplb_state is not None:
+            self.eplb_state.prepare_forward(
+                self.model_config, num_tokens_unpadded, ubatch_slices_padded
+            )
         deepep_auto_is_prefilling = None
         if self.hcu_feature_config.deepep_auto:
             deepep_auto_is_prefilling = (
@@ -5104,6 +5126,7 @@ class GPUModelRunner(
                                 vllm_config=self.vllm_config,
                                 model_config=self.model_config,
                             )
+                    self._preload_kimi_ht_communication()
                     self._preload_unquantized_gemm_kernels()
                     model_loader.load_weights(self.model, self.model_config)
                     if _has_online_quant(self.model):
@@ -5168,21 +5191,8 @@ class GPUModelRunner(
 
                     self.model.set_aux_hidden_state_layers(aux_layers)
 
-                if (
-                    is_mixture_of_experts(self.model)
-                    and self.parallel_config.enable_eplb
-                    and not load_dummy_weights
-                ):
-                    logger.info_once(
-                        "EPLB is enabled for model %s.",
-                        self.model_config.model,
-                    )
-                    assert self.eplb_state is not None
-                    self.eplb_state.add_model(
-                        self.model,
-                        self.model_config,
-                    )
-                    eplb_models += 1
+                if self.parallel_config.enable_eplb:
+                    eplb_models += self._register_eplb_model(load_dummy_weights)
 
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
@@ -5223,8 +5233,8 @@ class GPUModelRunner(
         )  # Temporary hack for dynamic res video w/o support for bs>1 yet
 
         if (
-            is_mixture_of_experts(self.model)
-            and self.parallel_config.enable_eplb
+            self.parallel_config.enable_eplb
+            and eplb_models > 0
             and not load_dummy_weights
             and self.eplb_state is not None
             and self.eplb_state.is_async
@@ -5273,6 +5283,22 @@ class GPUModelRunner(
 
         get_offloader().post_init()
 
+    def _preload_kimi_ht_communication(self) -> None:
+        # Diagnostic opt-in: reuse the production manager/cache, only move
+        # native initialization ahead of weight loading and GEMM warmup.
+        from os import environ
+        if (not henvs.VLLM_HCU_USE_CUSTOM_OPS or
+                environ.get("VLLM_HCU_KIMI_EARLY_HT_INIT", "0") != "1"):
+            return
+        if (self.model_config.quantization != "kimi_k3_w4a8" or
+                not self.parallel_config.enable_expert_parallel or
+                self.parallel_config.all2all_backend != "deepep_high_throughput"):
+            return
+        manager = get_ep_group().device_communicator.all2all_manager
+        manager.get_handle({})
+        logger.info("Initialized cached Kimi DeepEP HT buffer before weight load")
+        print("HCU early DeepEP HT buffer initialized before weight load", flush=True)
+
     @torch.inference_mode()
     def _preload_unquantized_gemm_kernels(self) -> None:
         """Warm HCU BF16 GEMM kernels BEFORE real checkpoint weights are streamed.
@@ -5305,6 +5331,10 @@ class GPUModelRunner(
 
         shapes: dict[tuple[int, int], torch.dtype] = {}
         for module in model.modules():
+            if getattr(module, "_hcu_weight_only_linear", False):
+                # These parameters are consumed directly by a fused operator,
+                # not by this module's linear forward/GEMM implementation.
+                continue
             weight = getattr(module, "weight", None)
             if not isinstance(weight, torch.Tensor):
                 continue
