@@ -19,13 +19,15 @@ def _prepare():
     load_general_plugins()
     from vllm.model_executor.model_loader.weight_cache import daemon
     from vllm_hcu.runtime_compat.weight_cache import (
-        install_expert_export_metadata, install_key_fingerprint,
-        install_ipc_quant_support, install_per_client_export, install_uuid_daemon,
+        install_cache_manifest, install_expert_export_metadata,
+        install_key_fingerprint, install_ipc_quant_support,
+        install_per_client_export, install_uuid_daemon,
     )
     install_key_fingerprint(daemon)
     install_per_client_export(daemon)
     install_expert_export_metadata(daemon)
     install_uuid_daemon(daemon)
+    install_cache_manifest(daemon)
     from vllm.model_executor.model_loader.weight_cache import protocol
     install_ipc_quant_support(protocol)
     return daemon

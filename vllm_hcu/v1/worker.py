@@ -165,6 +165,14 @@ class HcuGPUWorker(Worker):
                 "GLM5Next FP32 router GEMV bound to %d layers", num_router_gates
             )
         validate_worker_patches(require_applied=True)
+        audit_dir = os.environ.get("VLLM_HCU_PRELOAD_AUDIT_DIR")
+        if audit_dir:
+            from vllm_hcu.preload.audit import write_model_audits
+
+            write_model_audits(
+                model_runner, audit_dir, int(self.parallel_config.data_parallel_rank)
+            )
+            runner_logger.info("Full target/draft weight audit saved to %s", audit_dir)
 
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
@@ -298,7 +306,34 @@ class HcuGPUWorker(Worker):
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = request_memory(init_snapshot, self.cache_config)
+            # In zero-copy IPC mode the model weights already occupy device
+            # memory before this snapshot: they live in the weight-cache
+            # daemon and are mapped, not allocated, by this worker. Count them
+            # towards the gpu-memory-utilization budget so the startup check
+            # reflects the memory this instance really owns.
+            self._hcu_preload_resident_memory = 0
+            check_snapshot = init_snapshot
+            if self.vllm_config.load_config.load_format == "ipc_cache":
+                from vllm_hcu.runtime_compat.weight_cache import (
+                    budget_snapshot_with_resident,
+                    ipc_cache_resident_memory,
+                )
+
+                self._hcu_preload_resident_memory = ipc_cache_resident_memory(
+                    self.vllm_config
+                )
+                if self._hcu_preload_resident_memory:
+                    check_snapshot = budget_snapshot_with_resident(
+                        init_snapshot, self._hcu_preload_resident_memory
+                    )
+                    runner_logger.info(
+                        "Weight cache daemons already hold %s GiB of this "
+                        "worker's weights (zero-copy IPC); counting it towards "
+                        "the %.2f memory budget",
+                        format_gib(self._hcu_preload_resident_memory),
+                        self.cache_config.gpu_memory_utilization,
+                    )
+            self.requested_memory = request_memory(check_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
@@ -322,3 +357,26 @@ class HcuGPUWorker(Worker):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    def determine_available_memory(self) -> int:
+        available = super().determine_available_memory()
+        resident = getattr(self, "_hcu_preload_resident_memory", 0)
+        if resident and not self.cache_config.kv_cache_memory_bytes:
+            # The profiling snapshot only sees memory this worker allocates;
+            # the daemon-resident weights it maps zero-copy were allocated
+            # before the snapshot and must come out of the same budget.
+            available -= resident
+            if available <= 0:
+                raise RuntimeError(
+                    "weight cache preload leaves no memory for KV cache: "
+                    f"{format_gib(resident)} GiB daemon-resident weights "
+                    f"against a {format_gib(self.requested_memory)} GiB budget"
+                )
+            self.available_kv_cache_memory_bytes = available
+            runner_logger.info(
+                "Zero-copy preload weights leave %s GiB for KV cache after "
+                "accounting %s GiB of daemon-resident weights",
+                format_gib(available),
+                format_gib(resident),
+            )
+        return available

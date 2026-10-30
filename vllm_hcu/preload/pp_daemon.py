@@ -102,6 +102,13 @@ def main(daemon_module) -> None:
     tp_size = int(parallel.tensor_parallel_size)
     pp_size = int(parallel.pipeline_parallel_size)
     if pp_size <= 1:
+        if (
+            int(getattr(parallel, "data_parallel_size", 1)) > 1
+            or bool(getattr(parallel, "enable_expert_parallel", False))
+        ):
+            from vllm_hcu.preload.dp_ep_daemon import run_dp_ep_daemon
+
+            return run_dp_ep_daemon(daemon_module, args, vllm_config)
         # This path is retained for the existing, installed daemon behavior.
         return daemon_module.main()
     if vllm_config.load_config.load_format == "ipc_cache":

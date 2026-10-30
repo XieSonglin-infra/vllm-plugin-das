@@ -65,6 +65,36 @@ def apply_to_module(module: ModuleType) -> bool:
             f"required HCU patch target {TARGETS[2]} unexpectedly already exists"
         )
 
+    original_create = getattr(scheme_class, "create_weights", None)
+    if callable(original_create):
+        require_exact_signature(
+            original_create, f"{TARGET_MODULE}.CompressedTensorsW8A8Fp8.create_weights",
+            positional=("self", "layer", "input_size_per_partition",
+                        "output_partition_sizes", "input_size", "output_size",
+                        "params_dtype", "weight_loader"), var_keyword="kwargs",
+        )
+        @functools.wraps(original_create)
+        def hcu_create_weights(self, layer, input_size_per_partition,
+                               output_partition_sizes, input_size, output_size,
+                               params_dtype, weight_loader, **kwargs):
+            original_create(self, layer, input_size_per_partition,
+                            output_partition_sizes, input_size, output_size,
+                            params_dtype, weight_loader, **kwargs)
+            kernel_class = type(getattr(self, "fp8_linear", None))
+            reviewed = (
+                self.strategy == fp8_module.QuantizationStrategy.CHANNEL
+                and not self.is_static_input_scheme
+                and self.weight_block_size is None
+                and getattr(kernel_class, "_hcu_fp8_patch_applied", False)
+                and getattr(kernel_class, "_hcu_fp8_backend", None) in _SUPPORTED_FP8_BACKENDS
+            )
+            if reviewed:
+                layer.quant_method.supports_pre_processed_weights = True
+                layer._hcu_channel_fp8_expected_shape = (
+                    input_size_per_partition, sum(output_partition_sizes)
+                )
+        setattr(scheme_class, "create_weights", hcu_create_weights)
+
     @functools.wraps(original_process)
     def hcu_process_weights_after_loading(self, layer) -> None:
         channel_strategy = self.strategy == fp8_module.QuantizationStrategy.CHANNEL
@@ -79,6 +109,24 @@ def apply_to_module(module: ModuleType) -> bool:
                     "channelwise FP8 requires a reviewed HCU scaled-mm "
                     "adapter before weight processing"
                 )
+
+        from vllm.model_executor.utils import is_weights_pre_processed
+        if is_weights_pre_processed():
+            import torch
+            weight = getattr(layer, "weight", None)
+            scale = getattr(layer, "weight_scale", None)
+            expected = getattr(layer, "_hcu_channel_fp8_expected_shape", None)
+            if (not channel_strategy or self.is_static_input_scheme
+                or self.weight_block_size is not None or expected is None
+                or weight is None or tuple(weight.shape) != expected
+                or weight.dtype != torch.float8_e4m3fn
+                or weight.stride() != (1, expected[0])
+                or scale is None or tuple(scale.shape) != (expected[1], 1)
+                or scale.dtype != torch.float32):
+                raise RuntimeError("unsupported preprocessed Channel-FP8 weight layout")
+            weight.input_dim, weight.output_dim = 0, 1
+            layer.input_scale = None
+            return
 
         original_process(self, layer)
         if channel_strategy:

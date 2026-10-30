@@ -66,6 +66,51 @@ def _requested_selected_backend(moe) -> str | None:
     return selected_backend
 
 
+def _restore_preprocessed_channel_fp8(method, layer, fp8_moe_module):
+    """Restore only the bounded contiguous layout verified by the HCU probe."""
+    import torch
+
+    if (not _is_channel_token_route(fp8_moe_module, method.weight_quant,
+                                    method.input_quant)
+        or _selected_backend_name(method) != "HCU_DEEPGEMM"
+        or method.static_input_scales):
+        raise RuntimeError("unsupported preprocessed Channel-FP8 MoE scheme")
+    parallel = getattr(method.moe, "moe_parallel_config", None)
+    if parallel is None:
+        raise RuntimeError("unsupported preprocessed Channel-FP8 MoE topology")
+    w13, w2 = layer.w13_weight, layer.w2_weight
+    s13, s2 = layer.w13_weight_scale, layer.w2_weight_scale
+    common_sizes = (getattr(parallel, "tp_size", None),
+                    getattr(parallel, "pcp_size", None),
+                    getattr(parallel, "sp_size", None))
+    single = (common_sizes == (1, 1, 1)
+              and getattr(parallel, "dp_size", None) == 1
+              and getattr(parallel, "ep_size", None) == 1
+              and layer.local_num_experts == 1
+              and getattr(w13, "_hcu_dsv4_deepgemm_layout", None) in (None, "contiguous"))
+    shared_auto = (common_sizes == (1, 1, 1)
+                   and getattr(parallel, "dp_size", None) == 8
+                   and getattr(parallel, "ep_size", None) == 8
+                   and getattr(parallel, "all2all_backend", None) == "deepep_auto"
+                   and layer.local_num_experts == 32
+                   and getattr(w13, "_hcu_dsv4_deepgemm_layout", None) == "contiguous=masked")
+    if not (single or shared_auto):
+        raise RuntimeError("unsupported preprocessed Channel-FP8 MoE topology or layout")
+    count = layer.local_num_experts
+    if (tuple(w13.shape) != (count, 64, 256, 4, 16, 16)
+        or tuple(w2.shape) != (count, 32, 256, 4, 16, 16)
+        or w13.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn
+        or not w13.is_contiguous() or not w2.is_contiguous()
+        or tuple(s13.shape) != (count, 4096, 1)
+        or tuple(s2.shape) != (count, 4096, 1)
+        or s13.dtype != torch.float32 or s2.dtype != torch.float32
+        or not s13.is_contiguous() or not s2.is_contiguous()):
+        raise RuntimeError("unsupported preprocessed HCU Channel-FP8 MoE layout")
+    layer._dsv4_channel_deepgemm_layout = (
+        "contiguous=masked" if shared_auto else "contiguous"
+    )
+
+
 def apply_to_module(module: ModuleType) -> bool:
     fp8_moe_module = load_exact_module(TARGET_MODULE, module)
     method_class = require_class(
@@ -114,6 +159,9 @@ def apply_to_module(module: ModuleType) -> bool:
             requested_backend = _requested_selected_backend(moe)
         original_init(self, weight_quant, input_quant, moe, layer_name)
         if channel_token:
+            if (_selected_backend_name(self) == "HCU_DEEPGEMM"
+                and not getattr(self, "static_input_scales", True)):
+                self.supports_pre_processed_weights = True
             selected_backend = _selected_backend_name(self)
             if selected_backend is None:
                 raise RuntimeError(
@@ -132,6 +180,9 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_process)
     def hcu_process_weights_after_loading(self, layer):
+        from vllm.model_executor.utils import is_weights_pre_processed
+        if is_weights_pre_processed():
+            _restore_preprocessed_channel_fp8(self, layer, fp8_moe_module)
         original_process(self, layer)
         selected_backend = _selected_backend_name(self)
         if selected_backend == "AITER":

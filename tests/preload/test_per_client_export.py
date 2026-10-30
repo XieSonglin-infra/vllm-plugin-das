@@ -51,3 +51,40 @@ def test_export_is_per_matching_client_and_release_stops_exports():
     daemon._handle_get_state(None, {"cache_config": Key(1)})
     assert messages[-1]["status"] == "error"
     assert len(exports) == 2
+
+
+def test_unsupported_deepgemm_layout_is_rejected_before_ready():
+    import pytest
+    import torch
+    from vllm_hcu.runtime_compat.weight_cache import _validate_expert_cache_layouts
+    model = torch.nn.Module()
+    model.register_parameter("w13_weight", torch.nn.Parameter(torch.ones(1)))
+    model._dsv4_channel_deepgemm_layout = "contiguous+masked"
+    with pytest.raises(RuntimeError, match="unsupported DeepGEMM IPC layout"):
+        _validate_expert_cache_layouts(model)
+
+
+def test_export_failure_returns_explicit_error_to_client():
+    messages = []
+
+    class Key:
+        def mismatched_fields(self, other):
+            return []
+
+    class Daemon:
+        def _export_entries(self): pass
+        def _handle_get_state(self, conn, request): pass
+        def _handle_release(self): pass
+        def _gpu_uuid(self): return "uuid"
+
+    def failing_export(model):
+        raise RuntimeError("invalid exported layout")
+
+    module = SimpleNamespace(WeightCacheDaemon=Daemon, WeightCacheKey=Key,
+                             export_entries=failing_export,
+                             send_msg=lambda conn, msg: messages.append(msg))
+    install_per_client_export(module)
+    daemon = Daemon()
+    daemon.model, daemon.cache_config = object(), Key()
+    daemon._handle_get_state(None, {"cache_config": Key()})
+    assert messages == [{"status": "error", "message": "cache export failed: invalid exported layout"}]
