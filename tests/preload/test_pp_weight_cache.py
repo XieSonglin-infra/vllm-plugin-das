@@ -113,6 +113,64 @@ def test_pipeline_rank_plan_rejects_unbalanced_nodes():
         plan_local_pipeline_ranks(3, 2, 4, 0)
 
 
+@pytest.mark.parametrize(
+    "spec, expected",
+    [
+        (SimpleNamespace(method="mtp"), "only draft role"),
+        (
+            SimpleNamespace(
+                method="dspark",
+                draft_model_config=object(),
+                draft_parallel_config=SimpleNamespace(
+                    tensor_parallel_size=1,
+                    pipeline_parallel_size=2,
+                    data_parallel_size=1,
+                    enable_expert_parallel=False,
+                ),
+            ),
+            "tensor_parallel_size=8",
+        ),
+        (
+            SimpleNamespace(
+                method="dspark",
+                draft_model_config=object(),
+                draft_parallel_config=SimpleNamespace(
+                    tensor_parallel_size=8,
+                    pipeline_parallel_size=1,
+                    data_parallel_size=1,
+                    enable_expert_parallel=True,
+                ),
+            ),
+            "expert parallelism",
+        ),
+    ],
+)
+def test_pipeline_dspark_spec_rejects_unsupported_draft_topology(spec, expected):
+    from vllm_hcu.preload.pp_daemon import _validate_pipeline_spec
+
+    with pytest.raises(ValueError, match=expected):
+        _validate_pipeline_spec(spec, 8, 2)
+
+
+def test_pipeline_dspark_spec_accepts_matching_draft_topology():
+    from vllm_hcu.preload.pp_daemon import _validate_pipeline_spec
+
+    _validate_pipeline_spec(
+        SimpleNamespace(
+            method="dspark",
+            draft_model_config=object(),
+            draft_parallel_config=SimpleNamespace(
+                tensor_parallel_size=8,
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                enable_expert_parallel=False,
+            ),
+        ),
+        8,
+        2,
+    )
+
+
 def test_pipeline_socket_scope_uses_stage(monkeypatch):
     from vllm_hcu.runtime_compat.weight_cache import (
         _pipeline_context,

@@ -427,3 +427,30 @@ def test_situ_fallback_matches_native_dynamic_range(
     assert actual.dtype == dtype
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+def test_kda_external_conv_update_accepts_speculative_state_column(monkeypatch, batch):
+    patch = patch_kimi_k3_kda_reference_paths
+    target = ModuleType(patch.TARGET_MODULE)
+    target.causal_conv1d_fn = target.causal_conv1d_update = lambda *a, **k: None
+    target.chunk_kda_with_fused_gate = lambda **k: None
+    target.KimiK3DeltaAttention = type("Attention", (), {"_forward": lambda self: None})
+    patch.apply_to_module(target)
+    external = ModuleType("causal_conv1d")
+    seen = []
+
+    def update(*args, **kwargs):
+        seen.append(kwargs["conv_state_indices"])
+        assert seen[-1].stride(0) == 1
+        return args[0]
+
+    external.causal_conv1d_update = update
+    monkeypatch.setitem(sys.modules, "causal_conv1d", external)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_KIMI_CONV1D_BACKEND", "1")
+    indices = torch.arange(batch * 8, dtype=torch.int32).view(batch, 8)[:, 0]
+    assert indices.stride(0) == 8
+    x = torch.ones(batch, 4)
+    assert target.causal_conv1d_update(x, None, None, conv_state_indices=indices) is x
+    torch.testing.assert_close(seen[0], indices)

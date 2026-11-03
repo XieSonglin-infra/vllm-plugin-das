@@ -673,3 +673,43 @@ def test_router_hash_table_rebinds_to_loaded_gate_parameter():
     moved = reconcile_router_state_devices(model, torch.device("cpu"))
     assert model.mlp.experts.router._hash_indices_table is loaded
     assert "mlp.experts.router._hash_indices_table" in moved
+
+
+def test_precomputed_draft_key_uses_initialized_tp_rank(monkeypatch, tmp_path):
+    import vllm.distributed as distributed
+    from vllm_hcu.runtime_compat import weight_cache
+
+    config, _, draft, _ = _dspark_config(tmp_path)
+    config.parallel_config.tensor_parallel_size = 8
+    monkeypatch.setattr(distributed, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(distributed, "get_tensor_model_parallel_rank", lambda: 5)
+    calls = []
+
+    class Key:
+        @classmethod
+        def from_model_config(cls, model_config, tp_size, tp_rank):
+            calls.append((tp_size, tp_rank))
+            return object()
+
+    monkeypatch.setattr(weight_cache, "_precomputed_cache_keys", {})
+    weight_cache._precompute_draft_key(SimpleNamespace(WeightCacheKey=Key), config)
+    assert calls == [(8, 5)]
+
+
+def test_external_draft_defers_only_target_owned_placeholders():
+    from vllm_hcu.runtime_compat.weight_cache import _draft_entries_before_target_sharing
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=None), lm_head=None,
+        has_own_embed_tokens=False, has_own_lm_head=False,
+    )
+    entries = {"model.embed_tokens.weight": object(), "lm_head.weight": object(),
+               "model.context_proj.weight": object()}
+    aliases = {"lm_head.tied": "model.embed_tokens.weight"}
+    kept, kept_aliases = _draft_entries_before_target_sharing(model, entries, aliases)
+    assert list(kept) == ["model.context_proj.weight"]
+    assert kept_aliases == {}
+    # A draft with its own weights must still restore them from IPC.
+    model.has_own_embed_tokens = model.has_own_lm_head = True
+    kept, kept_aliases = _draft_entries_before_target_sharing(model, entries, aliases)
+    assert kept is entries and kept_aliases is aliases

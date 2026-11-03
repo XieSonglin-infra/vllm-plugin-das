@@ -54,11 +54,17 @@ def apply_to_module(module: ModuleType) -> bool:
                 or kwargs.get("query_start_loc") is not None):
             return original_update(x, conv_state, weight, bias, **kwargs)
         from causal_conv1d import causal_conv1d_update
+        indices = kwargs.get("conv_state_indices")
+        if indices is not None and indices.stride(0) != 1:
+            # Speculative Mamba state tables expose a strided column even
+            # for one request. contiguous() preserves a singleton's stride,
+            # while the external kernel requires an explicit unit stride.
+            indices = indices.clone(memory_format=torch.contiguous_format)
         # The external op returns its own dense output, like 0251. KDA uses
         # this return value, so do not add a copy into Triton's scratch buffer.
         return causal_conv1d_update(
             x, conv_state, weight, bias, activation=kwargs.get("activation"),
-            conv_state_indices=kwargs.get("conv_state_indices"))
+            conv_state_indices=indices)
 
     target.causal_conv1d_fn, target.causal_conv1d_update = hcu_fn, hcu_update
 

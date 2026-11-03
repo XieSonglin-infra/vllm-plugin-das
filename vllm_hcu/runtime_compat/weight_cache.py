@@ -70,6 +70,11 @@ def _precompute_draft_key(module, vllm_config):
     parallel = getattr(vllm_config, "parallel_config", None)
     tp_size = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
     tp_rank = int(getattr(parallel, "tensor_parallel_rank", 0) or 0)
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank, model_parallel_is_initialized,
+    )
+    if model_parallel_is_initialized():
+        tp_rank = get_tensor_model_parallel_rank()
     with _weight_cache_config_scope(
         vllm_config, draft_config, model_role="draft", parallel_config=draft_parallel
     ):
@@ -660,6 +665,9 @@ def ipc_cache_resident_memory(vllm_config, gpu_uuid=None, socket_dir=None):
     parallel = getattr(vllm_config, "parallel_config", None)
     pp_size = int(getattr(parallel, "pipeline_parallel_size", 1) or 1)
     pp_rank = int(getattr(parallel, "pipeline_parallel_rank", 0) or 0)
+    group_size, group_rank = _pipeline_context()
+    if group_size > 1:
+        pp_size, pp_rank = group_size, group_rank
     identifier = "uuid-" + str(gpu_uuid)
     if pp_size > 1:
         identifier = f"{identifier}-pp{pp_rank}"
@@ -667,7 +675,8 @@ def ipc_cache_resident_memory(vllm_config, gpu_uuid=None, socket_dir=None):
 
     roles = [("target", base)]
     spec = getattr(vllm_config, "speculative_config", None)
-    if spec is not None and getattr(spec, "method", None) == "dspark":
+    if (spec is not None and getattr(spec, "method", None) == "dspark"
+            and pp_rank == pp_size - 1):
         roles.append(("draft", base + ".draft"))
 
     resident = 0
@@ -723,6 +732,36 @@ def _rebind_expert_map_managers(model):
             manager._routing_tables = tables
 
 
+def _draft_entries_before_target_sharing(model, entries, aliases):
+    """Skip target-owned placeholders that DSpark binds after draft loading.
+
+    K3 exports the shared embedding/head as children in the daemon, but its
+    constructor intentionally leaves them None. They are already present in
+    the target IPC model and load_dspark_model will bind those same modules.
+    """
+    prefixes = []
+    inner = getattr(model, "model", None)
+    if (getattr(model, "has_own_embed_tokens", True) is False
+            and inner is not None and getattr(inner, "embed_tokens", False) is None):
+        prefixes.append("model.embed_tokens.")
+    if (getattr(model, "has_own_lm_head", True) is False
+            and getattr(model, "lm_head", False) is None):
+        prefixes.append("lm_head.")
+    if not prefixes:
+        return entries, aliases
+    prefixes = tuple(prefixes)
+    entries = {name: value for name, value in entries.items()
+               if not name.startswith(prefixes)}
+    remaining_aliases = {}
+    for name, canonical in aliases.items():
+        if name.startswith(prefixes):
+            continue
+        if canonical.startswith(prefixes):
+            raise RuntimeError(f"Draft-owned alias {name} refers to target-owned {canonical}")
+        remaining_aliases[name] = canonical
+    return entries, remaining_aliases
+
+
 def install_loader_compat(module: ModuleType) -> None:
     """Use UUID sockets and bounded startup waiting for strict cache loads."""
     import functools
@@ -762,6 +801,8 @@ def install_loader_compat(module: ModuleType) -> None:
         return original_materialize(model, target_device)
 
     def apply_entries(self, model, entries, aliases, device_index):
+        if _cache_model_role.get() == "draft":
+            entries, aliases = _draft_entries_before_target_sharing(model, entries, aliases)
         result = original_apply(self, model, entries, aliases, device_index)
         params = dict(model.named_parameters(remove_duplicate=False))
         for name, entry in entries.items():

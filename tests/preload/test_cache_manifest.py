@@ -215,3 +215,19 @@ def test_release_all2all_buffers_destroys_each_manager(monkeypatch):
     assert released.count("DeepEPFakeAll2AllManager") >= 2
     assert first in calls and second in calls
     assert calls.count(first) == 1
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_pp_dspark_only_last_stage_requires_draft_manifest(tmp_path, monkeypatch, pp_rank):
+    monkeypatch.setattr(weight_cache, "_pipeline_context", lambda: (2, pp_rank))
+    base = socket_base(tmp_path, identifier=f"uuid-A-pp{pp_rank}")
+    write_cache_manifest(FakeDaemon(base, make_model()))
+    config = _config(tmp_path, speculative=True)
+    # Real ParallelConfig has no pipeline_parallel_rank attribute: obtain it
+    # from the initialized PP group rather than silently selecting stage 0.
+    config.parallel_config = SimpleNamespace(pipeline_parallel_size=2)
+    if pp_rank == 1:
+        with pytest.raises(RuntimeError, match="manifest .* is missing"):
+            ipc_cache_resident_memory(config, gpu_uuid="A")
+        write_cache_manifest(FakeDaemon(base + ".draft", make_model(), role="draft"))
+    assert ipc_cache_resident_memory(config, gpu_uuid="A") == 4096

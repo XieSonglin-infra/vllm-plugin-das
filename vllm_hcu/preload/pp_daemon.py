@@ -34,6 +34,9 @@ def _run_pipeline_daemon(
     from vllm_hcu.preload.daemon import _prepare
 
     daemon_module = _prepare()
+    from vllm_hcu.patch.worker import apply_worker_patches
+
+    apply_worker_patches(vllm_config)
     import torch
     from vllm.config import set_current_vllm_config
     from vllm.distributed import (
@@ -70,11 +73,95 @@ def _run_pipeline_daemon(
                     backend=current_platform.dist_backend,
                 )
                 self.model = get_model(vllm_config=vllm_config)
+            torch.accelerator.empty_cache()
             self._export_entries()
 
     daemon = PipelineWeightCacheDaemon()
+
+    # V2 instantiates the independent DSpark draft only on the last target
+    # pipeline stage. Export a role-specific socket on those GPUs alone.
+    spec = getattr(vllm_config, "speculative_config", None)
+    draft_daemon = None
+    if spec is not None and global_rank // tp_size == pp_size - 1:
+        _validate_pipeline_spec(spec, tp_size, pp_size)
+        from vllm_hcu.runtime_compat.weight_cache import _weight_cache_config_scope
+
+        draft_config = spec.draft_model_config
+        draft_parallel = spec.draft_parallel_config
+        draft_daemon = PipelineWeightCacheDaemon()
+        draft_daemon.cache_role = "draft"
+        with _weight_cache_config_scope(
+            vllm_config,
+            draft_config,
+            model_role="draft",
+            parallel_config=draft_parallel,
+        ):
+            draft_daemon.cache_config = daemon_module.WeightCacheKey.from_model_config(
+                draft_config,
+                tp_size=tp_size,
+                tp_rank=global_rank % tp_size,
+            )
     daemon.load_model()
-    daemon.serve_forever(ready_callback=lambda: ready_queue.put(global_rank))
+    if draft_daemon is not None:
+        from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+
+        # Only the last PP stage participates in draft loading. The fast
+        # loader uses the full WORLD group and would wait for earlier stages.
+        from vllm.config import replace
+
+        draft_load_config = replace(
+            vllm_config,
+            load_config=replace(vllm_config.load_config, load_format="safetensors"),
+        )
+        with set_current_vllm_config(draft_load_config):
+            draft_daemon.model = load_dspark_model(daemon.model, draft_load_config)
+        torch.accelerator.empty_cache()
+        draft_daemon._export_entries()
+
+    if draft_daemon is None:
+        daemon.serve_forever(ready_callback=lambda: ready_queue.put(global_rank))
+    else:
+        print(
+            f"PP/TP cache rank ready-to-serve: global_rank={global_rank} "
+            f"pp_rank={global_rank // tp_size} tp_rank={global_rank % tp_size} "
+            f"model_role=target tensor_names={len(daemon.entries)} "
+            f"draft_tensor_names={len(draft_daemon.entries)}",
+            flush=True,
+        )
+        from vllm_hcu.preload.dp_ep_daemon import _serve_roles
+
+        _serve_roles((daemon, draft_daemon), local_rank, global_rank, ready_queue)
+
+
+def _validate_pipeline_spec(spec, tp_size: int, pp_size: int) -> None:
+    """Validate the only draft topology supported by the PP cache launcher."""
+    if getattr(spec, "method", None) != "dspark":
+        raise ValueError(
+            "pipeline weight-cache preload currently supports DSpark as its "
+            "only draft role"
+        )
+    draft_config = getattr(spec, "draft_model_config", None)
+    draft_parallel = getattr(spec, "draft_parallel_config", None)
+    if draft_config is None or draft_parallel is None:
+        raise ValueError("DSpark draft model and parallel configurations are required")
+    # vLLM creates DSpark's draft parallel config with the target TP but a
+    # single pipeline stage. The draft model is still served by the target PP
+    # rank that owns its target-layer state; requiring draft PP=2 would reject
+    # every valid PP2 DSpark engine configuration.
+    fields = {
+        "tensor_parallel_size": tp_size,
+        "pipeline_parallel_size": 1,
+        "data_parallel_size": 1,
+    }
+    for name, expected in fields.items():
+        actual = int(getattr(draft_parallel, name, 1) or 1)
+        if actual != expected:
+            raise ValueError(
+                "PP/TP DSpark preload requires draft "
+                f"{name}={expected}, got {actual}"
+            )
+    if bool(getattr(draft_parallel, "enable_expert_parallel", False)):
+        raise ValueError("PP/TP DSpark preload does not support draft expert parallelism")
 
 
 def main(daemon_module) -> None:
@@ -121,7 +208,15 @@ def main(daemon_module) -> None:
     if parallel.enable_expert_parallel:
         raise ValueError("pipeline weight cache currently does not support expert parallelism")
 
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is not None:
+        _validate_pipeline_spec(spec, tp_size, pp_size)
+
     daemon_module.check_ipc_quant_support(vllm_config.model_config, where="daemon")
+    if spec is not None:
+        daemon_module.check_ipc_quant_support(
+            spec.draft_model_config, where="daemon draft"
+        )
     nnodes = int(parallel.nnodes)
     node_rank = int(parallel.node_rank)
     world_size = tp_size * pp_size
