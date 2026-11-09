@@ -8,6 +8,11 @@ from vllm import ModelRegistry
 
 def register_model():
     ModelRegistry.register_model(
+        "KimiK31ForConditionalGeneration",
+        "vllm_hcu.models.kimi_k31:KimiK31ForConditionalGeneration",
+    )
+
+    ModelRegistry.register_model(
         "DeepseekV3ForCausalLM", "vllm_hcu.models.deepseek_v2:DeepseekV3ForCausalLM"
     )
 
