@@ -103,8 +103,9 @@ class KimiK31ForConditionalGeneration(
     The existing KimiLinear decoder supplies embeddings, MoE, KDA, MLA,
     residual blocks, PP partitioning, recurrent state, and weight loading.
     DSA indexer parameters are attached to local DSA layers by their global
-    layer index. Request forward remains fail-closed until the HCU DSA path is
-    implemented.
+    layer index. For the checkpoint's bounded short-context configuration,
+    the existing causal dense NoPE MLA path is equivalent while every valid
+    causal key fits inside index_topk. Longer contexts remain fail-closed.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -149,6 +150,23 @@ class KimiK31ForConditionalGeneration(
                 self.text_config, prefix=indexer_prefix
             )
 
+    def _short_context_dense_dsa_supported(self) -> bool:
+        dsa = self.text_config.dsa_config
+        if not dsa or not self.dsa_layer_indices:
+            return True
+        model_config = self.vllm_config.model_config
+        max_model_len = model_config.max_model_len
+        rope = getattr(self.text_config, "rope_parameters", None) or {}
+        rope_type = rope.get("rope_type", "default")
+        return (
+            self.text_config.mla_use_nope is True
+            and dsa.index_topk_freq == 1
+            and dsa.index_skip_topk_offset == 1
+            and dsa.index_rope_dim == 0
+            and rope_type in (None, "default")
+            and max_model_len <= dsa.index_topk
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -157,9 +175,19 @@ class KimiK31ForConditionalGeneration(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ):
-        if self.dsa_layer_indices:
+        if not self._short_context_dense_dsa_supported():
+            dsa = self.text_config.dsa_config
             raise NotImplementedError(
-                "Kimi-K3.1 DSA attention forward is not implemented on HCU yet"
+                "Kimi-K3.1 DSA dense fallback is restricted to NoPE models "
+                "with index_rope_dim=0, index_topk_freq=1, "
+                "index_skip_topk_offset=1, default rope scaling, and "
+                "max_model_len <= index_topk; got "
+                f"max_model_len={self.vllm_config.model_config.max_model_len}, "
+                f"index_topk={dsa.index_topk}, "
+                f"index_topk_freq={dsa.index_topk_freq}, "
+                f"index_skip_topk_offset={dsa.index_skip_topk_offset}, "
+                f"index_rope_dim={dsa.index_rope_dim}, "
+                f"mla_use_nope={self.text_config.mla_use_nope}"
             )
         return self.language_model(
             input_ids=input_ids,
