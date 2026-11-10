@@ -395,6 +395,11 @@ class KimiK31ForConditionalGeneration(
             self.quant_config,
             old.prefix,
         )
+        # The outer attention owns the checkpoint parameters in both dense
+        # and sparse modes. Keep the forward reference without registering a
+        # second owner, so IPC/state_dict paths do not depend on context size.
+        del sparse._modules["indexer"]
+        object.__setattr__(sparse, "indexer", indexer)
         if getattr(old, "_hcu_fused_output_gate", False):
             sparse._hcu_fused_output_gate = True
         attention.mla_attn = sparse
