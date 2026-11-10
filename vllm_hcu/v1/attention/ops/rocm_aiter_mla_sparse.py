@@ -1952,6 +1952,9 @@ def rocm_aiter_sparse_attn_indexer_native(
             # merge gathers scores only at those selected indices, so no
             # decode consumer reads the unwritten tail.
             clean_logits=False,
+            kcache_layout=getattr(
+                layer_attn_metadata, "hcu_indexer_kcache_layout", "preshuffle"
+            ),
         )
 
         # A padded decode batch has more kernel rows than actual decode
