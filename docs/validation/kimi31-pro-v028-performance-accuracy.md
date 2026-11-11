@@ -11,6 +11,156 @@
 - expanded prefill 的 guard 要求单请求 fresh 4096 token、精确形状、本地 12 heads、BF16 当前输入及投影权重等条件。FP8 cache 本身不能单独判定该分支是否命中。完整服务测试未采集逐次命中计数。
 - 默认 sparse provider 仍由源码的 `flashmla` 默认值决定。HIP、migrated HIP 与 CK 实验保留供复现，需要显式选择和构建。本次性能采用 expanded_masked 配置。
 
+
+## 等效环境变量与 vllm serve 命令
+
+以下命令按成功复测的 `retest_01/reports/engine_node{0,1}.command.json` 整理。两节点分别在各自的 `xiesl_kimi3_plugin_028` 容器内执行，使用 Bash。宿主机 `/public/home/xiesl` 在本容器映射为 `/home/xiesl`。管理地址为 10.16.1.22 / 10.16.1.20，分布式通信地址为 13.13.4.22 / 13.13.4.20。
+
+先在各节点宿主机进入容器，固定 editable 插件的工作目录。
+
+```bash
+docker exec -it \
+  -w /home/xiesl/inference/send_time/vllm-plugin-das \
+  xiesl_kimi3_plugin_028 bash
+```
+
+两个节点均设置以下环境变量。
+
+```bash
+cd /home/xiesl/inference/send_time/vllm-plugin-das
+
+export VLLM_USE_NN=0
+export VLLM_HCU_USE_CUSTOM_OPS=1
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_KIMI_CONV1D_BACKEND=1
+export VLLM_KIMI_FLASHKDA_BACKEND=1
+export VLLM_ENGINE_READY_TIMEOUT_S=7200
+export VLLM_FASTSAFETENSORS_QUEUE_SIZE=-1
+export GPU_MAX_HW_QUEUES=4
+export PYTHONUNBUFFERED=1
+
+export NCCL_SOCKET_IFNAME=ens61f1np1
+export GLOO_SOCKET_IFNAME=ens61f1np1
+export NCCL_IB_HCA=mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1
+
+export VLLM_HCU_KIMI_SPARSE_MLA_BACKEND=expanded_masked
+export VLLM_HCU_KIMI_SPARSE_MLA_VALIDATE=0
+export VLLM_HCU_KIMI_SHARE_QKV_QUANT=1
+export VLLM_HCU_KIMI_MERGE_QKV_GEMM=0
+export VLLM_HCU_KIMI_MERGE_QKV_VALIDATE=0
+
+export VLLM_ROCM_USE_AITER_CUSTOM_AR=0
+export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+export VLLM_ALLREDUCE_USE_FLASHINFER=0
+export VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=0
+export VLLM_USE_NCCL_SYMM_MEM=0
+export VLLM_HCU_DP_CUSTOM_AG=0
+export VLLM_HCU_EP_FUSED_COMBINE=0
+
+MODEL=/public4/share/wufan/model/Kimi-K3.1-Pro-CHANNEL-INT4-w4a8
+MASTER_ADDR=13.13.4.22
+IPC_DIR=/tmp/k31v1pp2r1
+```
+
+22 节点设置本节点身份。
+
+```bash
+NODE_RANK=0
+export VLLM_HOST_IP=13.13.4.22
+```
+
+20 节点设置本节点身份。
+
+```bash
+NODE_RANK=1
+export VLLM_HOST_IP=13.13.4.20
+```
+
+### Preload 前提
+
+服务使用 `--load-format ipc_cache`，要求两节点的匹配 preload daemon 已经 READY，且在 engine 运行期间保持存活。本次复测 socket 目录为 `/tmp/k31v1pp2r1`，首轮为 `/tmp/k31v1pp2`，daemon 与 engine 需要使用同一个目录。以下是从磁盘预载时的等效命令，在两节点分别使用上述环境和对应 NODE_RANK 执行。保留各自的前台 daemon 终端，服务另开终端并设置同一组环境变量。
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 TMPDIR=/tmp \
+python3 -u -m vllm_hcu.preload.daemon \
+  --enable-full-model-preload \
+  --model "$MODEL" \
+  --trust-remote-code \
+  --language-model-only \
+  --tokenizer-mode kimi_k3 \
+  --quantization slimquant_w4a8 \
+  --dtype bfloat16 \
+  --tensor-parallel-size 8 \
+  --pipeline-parallel-size 2 \
+  --nnodes 2 \
+  --node-rank "$NODE_RANK" \
+  --master-addr "$MASTER_ADDR" \
+  --distributed-executor-backend mp \
+  --max-model-len 16384 \
+  --gpu-memory-utilization 0.20 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 8192 \
+  --mamba-ssm-cache-dtype bfloat16 \
+  --disable-custom-all-reduce \
+  --enforce-eager \
+  --enable-prefix-caching \
+  --mamba-cache-mode align \
+  --block-size 64 \
+  --load-format fastsafetensors \
+  --weight-cache-master-port 29762 \
+  --weight-cache-socket-dir "$IPC_DIR" \
+  --kv-cache-dtype fp8_e4m3
+```
+
+### 启动双节点服务
+
+两节点 preload 均 READY 后，在各节点的服务终端执行以下命令。22 提供 API，20 使用 headless 模式。IPC 的 `fallback=false` 对应本次严格复用权重的配置。
+
+```bash
+node_args=(--headless)
+if [[ "$NODE_RANK" == 0 ]]; then
+  node_args=(--host 0.0.0.0 --port 19462)
+fi
+
+vllm serve "$MODEL" \
+  --trust-remote-code \
+  --tokenizer-mode kimi_k3 \
+  --quantization slimquant_w4a8 \
+  --dtype bfloat16 \
+  --load-format ipc_cache \
+  --model-loader-extra-config "{\"socket_dir\": \"$IPC_DIR\", \"fallback\": false, \"state_timeout_s\": 7200}" \
+  --tensor-parallel-size 8 \
+  --pipeline-parallel-size 2 \
+  --nnodes 2 \
+  --node-rank "$NODE_RANK" \
+  --master-addr "$MASTER_ADDR" \
+  --master-port 29562 \
+  --distributed-executor-backend mp \
+  --distributed-timeout-seconds 7200 \
+  --max-model-len 16384 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.90 \
+  --attention-backend FLASHMLA_SPARSE \
+  --kv-cache-dtype fp8_e4m3 \
+  --block-size 64 \
+  --mamba-ssm-cache-dtype bfloat16 \
+  --enable-prefix-caching \
+  --mamba-cache-mode align \
+  --disable-custom-all-reduce \
+  --enforce-eager \
+  --reasoning-parser kimi_k3 \
+  --enable-auto-tool-choice \
+  --tool-call-parser kimi_k3 \
+  "${node_args[@]}"
+```
+
+镜像的 `vllm` 可执行文件直接调用 `vllm.entrypoints.cli.main:main`，因此上面的 `vllm serve` 与实测的 `python3 -u -m vllm.entrypoints.cli.main serve` 使用同一个入口，`PYTHONUNBUFFERED=1` 提供等效的无缓冲输出。API 地址为 `http://13.13.4.22:19462`。
+
+文档中的 6 个 Bash 代码块通过语法检查。使用命令替身展开后，两节点 serve argv、25 项显式环境变量，以及 daemon argv、20 项显式环境变量均与成功复测归档一致。
+
+精度评测的 `temperature=0`、`top_p=1`、`seed=20261026`、`max_tokens=4096` 以及顶层 `chat_template_kwargs={"enable_thinking": false}` 由客户端随请求发送，并发为 32。性能评测的 4096/1 与各档并发也由客户端指定。
+
 ## 完整模型 prefill 性能
 
 本次配置为 eager、max_model_len=16384、max_num_seqs=128、max_num_batched_tokens=8192、block_size=64、SSM BF16、prefix caching 开启并使用 Mamba align。公开 FP8 E4M3 KV 通过正式 FLASHMLA_SPARSE 路径归一化为内部 fp8_ds_mla 格式。权重由独立 daemon 预载，engine 使用 strict IPC。
