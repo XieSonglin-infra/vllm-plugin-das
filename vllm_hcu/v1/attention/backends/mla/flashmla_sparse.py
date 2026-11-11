@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
@@ -38,6 +40,12 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._kimi_sparse_backend = os.environ.get(
+            "VLLM_HCU_KIMI_SPARSE_MLA_BACKEND", "flashmla"
+        )
+        if self._kimi_sparse_backend not in {"flashmla", "aiter_tilelang", "dense_masked", "expanded_masked", "fused_hip", "migrated_hip"}:
+            raise ValueError("Unknown Kimi sparse MLA backend: " + self._kimi_sparse_backend)
+        self._kimi_sparse_validated = 0
         self._fp8_nope = (
             self.kv_cache_dtype == "fp8_ds_mla"
             and self.qk_rope_head_dim == 0
@@ -53,6 +61,77 @@ class HcuFlashMLASparseImpl(FlashMLASparseImpl):
                 self._fp8_nope_query_spec
             )
             self._fp8_nope_pe_buffer = self.q_concat_buffer.new_zeros((shape[0], 64))
+
+    def _forward_bf16_kv(self, q, cache, indices, metadata, actual_num_heads):
+        supported = (
+            self._kimi_sparse_backend == "dense_masked"
+            and self.dcp_world_size == 1 and not self.need_to_return_lse_for_decode
+            and metadata.num_reqs == 1 and metadata.max_query_len == 4096
+            and metadata.max_seq_len == 4096 and metadata.num_actual_tokens == 4096
+            and q.shape == (4096, 64, 576) and actual_num_heads == 12
+            and q.dtype == torch.bfloat16 and cache.dtype == q.dtype
+            and indices.shape == (4096, 2048)
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if not supported:
+            return super()._forward_bf16_kv(q, cache, indices, metadata, actual_num_heads)
+        from vllm.v1.attention.backends.mla.flashmla_sparse import flat_kv_row_view
+        from vllm_hcu.v1.attention.ops.kimi_sparse_mla import kimi_sparse_mla_dense_masked
+
+        rows, stride = flat_kv_row_view(cache, metadata.block_size)
+        logical = torch.arange(4096, device=q.device)
+        physical = (metadata.block_table[0, logical // metadata.block_size].long()
+                    * stride + logical % metadata.block_size)
+        # Copy only the request's 4096 KV rows, including noncontiguous blocks.
+        kv = rows.index_select(0, physical).view(4096, 1, 576)
+        output = kimi_sparse_mla_dense_masked(q[:, :12], kv, indices, self.softmax_scale)
+        if (os.environ.get("VLLM_HCU_KIMI_SPARSE_MLA_VALIDATE", "0") == "1"
+                and self._kimi_sparse_validated < 1):
+            reference, _ = super()._forward_bf16_kv(q, cache, indices, metadata, actual_num_heads)
+            torch.testing.assert_close(output, reference, rtol=0.02, atol=0.005)
+            maximum = (output - reference).abs().max().item()
+            print(f"KIMI_DENSE_MASKED_VALIDATED shape={tuple(q.shape)} max_abs={maximum}", flush=True)
+            self._kimi_sparse_validated += 1
+        return output, None
+
+    def _bf16_flash_mla_kernel(
+        self, q, kv_c_and_k_pe_cache, topk_indices, topk_length=None,
+        actual_num_heads=None,
+    ):
+        heads = q.shape[1] if actual_num_heads is None else actual_num_heads
+        supported = (
+            self._kimi_sparse_backend == "aiter_tilelang"
+            and self.dcp_world_size == 1
+            and not self.need_to_return_lse_for_decode
+            and q.dtype == torch.bfloat16
+            and kv_c_and_k_pe_cache.dtype == q.dtype
+            and q.shape[0] >= 512 and heads == 12 and q.shape[-1] == 576
+            and topk_indices.shape[-1] == 2048
+            and kv_c_and_k_pe_cache.is_contiguous()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if not supported:
+            return super()._bf16_flash_mla_kernel(
+                q, kv_c_and_k_pe_cache, topk_indices, topk_length, actual_num_heads
+            )
+        from vllm_hcu.v1.attention.ops.kimi_sparse_mla import kimi_sparse_mla_aiter
+
+        cache = kv_c_and_k_pe_cache.view(-1, 1, 576)
+        output = kimi_sparse_mla_aiter(
+            q[:, :heads], cache, topk_indices, self.softmax_scale, topk_length
+        )
+        # Optional real-input verification is for a separate validation run.
+        # Warmup must finish this check before timed requests or profiling.
+        if (os.environ.get("VLLM_HCU_KIMI_SPARSE_MLA_VALIDATE", "0") == "1"
+                and self._kimi_sparse_validated < 1):
+            reference, _ = super()._bf16_flash_mla_kernel(
+                q, kv_c_and_k_pe_cache, topk_indices, topk_length, actual_num_heads
+            )
+            torch.testing.assert_close(output, reference, rtol=0.02, atol=0.005)
+            print("KIMI_SPARSE_MLA_VALIDATED", tuple(q.shape),
+                  "max_abs", (output - reference).abs().max().item(), flush=True)
+            self._kimi_sparse_validated += 1
+        return output, None
 
     def forward_mqa(
         self,

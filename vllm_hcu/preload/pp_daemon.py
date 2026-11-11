@@ -59,6 +59,19 @@ def _run_pipeline_daemon(
 
         def load_model(self) -> None:
             torch.accelerator.set_device_index(self.local_rank)
+            # Match the TP daemon before constructing sparse MLA workspaces.
+            from vllm.v1.worker.workspace import (
+                init_workspace_manager, is_workspace_manager_initialized,
+            )
+
+            if not is_workspace_manager_initialized():
+                parallel = self.vllm_config.parallel_config
+                spec = getattr(self.vllm_config, "speculative_config", None)
+                init_workspace_manager(
+                    torch.device("cuda", self.local_rank),
+                    num_ubatches=2 if getattr(parallel, "enable_dbo", False) else 1,
+                    num_lanes=2 if getattr(spec, "method", None) == "dspark" else 1,
+                )
             init_distributed_environment(
                 world_size=tp_size * pp_size,
                 rank=self.global_rank,
@@ -183,6 +196,9 @@ def main(daemon_module) -> None:
         "from the engine master port.",
     )
     args = parser.parse_args()
+    from vllm_hcu.runtime_compat.weight_cache import validate_preload_socket_dir
+
+    validate_preload_socket_dir(args.weight_cache_socket_dir)
     engine_args = EngineArgs.from_cli_args(args)
     vllm_config = engine_args.create_engine_config()
     parallel = vllm_config.parallel_config

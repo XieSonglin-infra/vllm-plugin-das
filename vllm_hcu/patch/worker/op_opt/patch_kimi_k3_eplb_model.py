@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Expose Kimi-K3's local routed experts through vLLM's EPLB protocol."""
+"""Adapt Kimi-K3 local-layer expert loading and the vLLM EPLB protocol."""
 
 from __future__ import annotations
 
@@ -29,11 +29,30 @@ _MOE_INIT_WRAPPER = "_vllm_hcu_kimi_k3_w4a8_native_width_wrapper"
 _LOAD_WRAPPER = "_vllm_hcu_kimi_k3_redundant_expert_loader"
 
 
+def _local_layer_weights(model, weights):
+    """Exclude absent partial/PP layers before the legacy expert-name lookup."""
+    import re
+
+    first = int(getattr(model, "start_layer", 0))
+    last = getattr(model, "end_layer", None)
+    if last is None:
+        last = getattr(getattr(model, "config", None), "num_hidden_layers", None)
+    pattern = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    for entry in weights:
+        match = pattern.search(entry[0])
+        if match is not None and last is not None:
+            layer = int(match.group(1))
+            if not first <= layer < int(last):
+                continue
+        yield entry
+
+
 def _wrap_model_load_weights(model_cls) -> None:
     original_load = require_callable(model_cls, "load_weights", TARGETS[2])
 
     @functools.wraps(original_load)
     def load_weights(self, weights):
+        weights = _local_layer_weights(self, weights)
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
         # Delegate redundant experts to their owning loader. The legacy Kimi

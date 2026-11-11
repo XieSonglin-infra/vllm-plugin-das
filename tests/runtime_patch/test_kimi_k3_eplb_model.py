@@ -290,3 +290,34 @@ def test_kimi_redundant_loader_preserves_other_weights_and_pp_missing_layer_skip
     assert "extra_weight" in loaded
     assert not any(name.startswith("layers.3.") for name in loaded)
     torch.testing.assert_close(model.extra_weight, torch.ones(2, 2))
+
+
+@pytest.mark.parametrize('start,end', [(0,12), (4,8)])
+def test_partial_layer_experts_skip_absent_layers(start,end):
+    class Model:
+        start_layer = start
+        end_layer = end
+
+        def named_modules(self):
+            return iter(())
+
+        def load_weights(self, weights):
+            loaded = []
+            for entry in weights:
+                name = entry[0]
+                if name.startswith('layers.'):
+                    layer = int(name.split('.')[1])
+                    if not start <= layer < end:
+                        raise KeyError(name)
+                loaded.append(entry)
+            return loaded
+
+    weights = [(f'layers.{i}.block_sparse_moe.experts.0.w1.weight', object()) for i in range(16)]
+    weights += [('embed_tokens.weight', object()), ('norm.weight', object())]
+    with pytest.raises(KeyError):
+        Model().load_weights(iter(weights))
+    patch._wrap_model_load_weights(Model)
+    actual = Model().load_weights(iter(weights))
+    expected = [entry for i,entry in enumerate(weights) if start <= i < end or i >=16]
+    assert actual == expected
+    assert all(a is b for a,b in zip(actual,expected))

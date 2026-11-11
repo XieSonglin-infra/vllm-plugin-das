@@ -1,0 +1,8 @@
+{
+  "include": "/usr/local/lib/python3.10/dist-packages/aiter_meta/3rdparty/composable_kernel/include",
+  "sources": {
+    "ck_tile/ops/fmha/kernel/fmha_fwd_kernel.hpp": "69a60603be8c163880831959b770c13e9d4fe7523b46936fce9968bf5c692cb3",
+    "ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs.hpp": "ab7de3af805e04cb81afd4bd647023fb8b41c5993b02d5f1dfd8d13a15e710e1"
+  },
+  "license": "MIT; preserved upstream/Hygon notices"
+}

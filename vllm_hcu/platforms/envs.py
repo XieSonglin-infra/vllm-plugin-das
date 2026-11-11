@@ -42,6 +42,11 @@ if TYPE_CHECKING:
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
+    VLLM_HCU_KIMI_SPARSE_MLA_VALIDATE: bool = False
+    VLLM_HCU_KIMI_SPARSE_MLA_BACKEND: str = "flashmla"
+    VLLM_HCU_KIMI_SHARE_QKV_QUANT: bool = False
+    VLLM_HCU_KIMI_MERGE_QKV_GEMM: bool = False
+    VLLM_HCU_KIMI_MERGE_QKV_VALIDATE: bool = False
     VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
@@ -470,6 +475,18 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
                     ("true", "1")),
 
     # If set, use LightOp top_k_per_row kernels for sparse MLA prefill/decode indices.
+    # BF16 Kimi TP8 prefill only; unsupported shapes keep FlashMLA.
+    "VLLM_HCU_KIMI_SPARSE_MLA_VALIDATE":
+        lambda: os.environ.get("VLLM_HCU_KIMI_SPARSE_MLA_VALIDATE", "0") == "1",
+    "VLLM_HCU_KIMI_SPARSE_MLA_BACKEND":
+        lambda: os.environ.get("VLLM_HCU_KIMI_SPARSE_MLA_BACKEND", "flashmla"),
+    "VLLM_HCU_KIMI_MERGE_QKV_GEMM":
+        lambda: os.environ.get("VLLM_HCU_KIMI_MERGE_QKV_GEMM", "0") == "1",
+    "VLLM_HCU_KIMI_MERGE_QKV_VALIDATE":
+        lambda: os.environ.get("VLLM_HCU_KIMI_MERGE_QKV_VALIDATE", "0") == "1",
+    "VLLM_HCU_KIMI_SHARE_QKV_QUANT":
+        lambda: os.environ.get("VLLM_HCU_KIMI_SHARE_QKV_QUANT", "False").lower()
+        in ("1", "true"),
     "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK":
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", "True").lower() in
                     ("true", "1")),

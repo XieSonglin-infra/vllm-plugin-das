@@ -31,6 +31,38 @@ _MARKER = "_vllm_hcu_mla_attention_applied"
 _WRAPPER = "_vllm_hcu_mla_attention_wrapper"
 
 
+def _install_decode_concat_fp8_hip_compat(mla):
+    """Avoid subclass redispatch in QuantFP8.forward_hip's CUDA fallback."""
+    cls = getattr(mla, "_DecodeConcatQuantFP8", None)
+    if cls is None:
+        return
+    from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+
+    original = cls.forward_hip
+    if getattr(original, "_vllm_hcu_concat_fp8_hip_compat", False):
+        return
+
+    @functools.wraps(original)
+    def forward_hip(self, decode_ql_nope, decode_q_pe, scale, scale_ub=None):
+        import torch
+        decode_q0 = torch.cat((decode_ql_nope, decode_q_pe), dim=-1)
+        flat = decode_q0.reshape(decode_q0.shape[0], -1)
+        # Match upstream HIP eligibility, including the three supported groups.
+        use_aiter = (self.use_aiter and scale_ub is None and flat.is_contiguous()
+                     and (self.group_shape.is_per_tensor()
+                          or self.group_shape.is_per_token()
+                          or self.group_shape.is_per_group()))
+        if use_aiter:
+            quantized, _ = QuantFP8.forward_hip(self, flat, scale, scale_ub)
+        else:
+            # Explicit base dispatch: self.forward_cuda is the concat subclass.
+            quantized, _ = QuantFP8.forward_cuda(self, flat, scale, scale_ub)
+        return quantized.view(decode_q0.shape)
+
+    forward_hip._vllm_hcu_concat_fp8_hip_compat = True
+    cls.forward_hip = forward_hip
+
+
 def apply_to_module(module: ModuleType) -> bool:
     mla = load_exact_module(TARGET_MODULE, module)
     cls = require_class(mla, "MLAAttention", f"{TARGET_MODULE}.MLAAttention")
@@ -370,6 +402,45 @@ def apply_to_module(module: ModuleType) -> bool:
         config = getattr(self, "_hcu_feature_config", None)
         if config is None:
             raise RuntimeError("HCU MLA feature config was not initialized")
+        if (not config.enable_lightly_cp and output_scale is None
+                and output_block_scale is None and q_dcp_replicated is None
+                and getattr(getattr(self, "impl", None), "_kimi_sparse_backend", "flashmla") in {"expanded_masked", "fused_hip", "migrated_hip"}
+                and (self.impl._kimi_sparse_backend not in {"fused_hip", "migrated_hip"} or all(x is None for x in (
+                    quant_group_size, quant_scale_ue8m0, quant_col_major, quant_tma_aligned)))):
+            from vllm_hcu.v1.attention.ops.kimi_expanded_mla import (
+                supports_expanded_prefill, expanded_sparse_mla,
+            )
+            if self.impl._kimi_sparse_backend == "fused_hip":
+                from vllm_hcu.v1.attention.ops.kimi_fused_sparse_mla import (
+                    supports_fused_prefill as supports_expanded_prefill,
+                    fused_sparse_mla as expanded_sparse_mla,
+                )
+            elif self.impl._kimi_sparse_backend == "migrated_hip":
+                from vllm_hcu.v1.attention.ops.kimi_migrated_sparse_mla import (
+                    supports_migrated_prefill as supports_expanded_prefill,
+                    migrated_sparse_mla as expanded_sparse_mla,
+                )
+            if supports_expanded_prefill(self, q, k_c_normed, k_pe, attn_metadata, output):
+                import os
+                import torch
+                result = expanded_sparse_mla(
+                    q, k_c_normed, k_pe, self.W_UK_T, self.W_UV,
+                    self.impl.topk_indices_buffer[:4096], self.scale,
+                )
+                if (os.environ.get("VLLM_HCU_KIMI_SPARSE_MLA_VALIDATE", "0") == "1"
+                        and not getattr(self, "_hcu_expanded_validated", False)):
+                    reference = torch.empty_like(output)
+                    original_forward(self, q, k_c_normed, k_pe, kv_cache,
+                                     attn_metadata, reference)
+                    torch.testing.assert_close(result, reference, rtol=0.02, atol=0.005)
+                    maximum = (result - reference).abs().max().item()
+                    label = ("KIMI_MIGRATED_MLA_VALIDATED" if self.impl._kimi_sparse_backend == "migrated_hip"
+                             else "KIMI_FUSED_HIP_MLA_VALIDATED" if self.impl._kimi_sparse_backend == "fused_hip"
+                             else "KIMI_EXPANDED_MLA_VALIDATED")
+                    print(f"{label} shape={tuple(q.shape)} max_abs={maximum}", flush=True)
+                    self._hcu_expanded_validated = True
+                output.copy_(result)
+                return output
         if not config.enable_lightly_cp:
             return original_forward(
                 self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
@@ -598,6 +669,7 @@ def apply_to_module(module: ModuleType) -> bool:
         "_get_kv_b_proj_input_dtype",
         hcu_get_kv_b_proj_input_dtype,
     )
+    _install_decode_concat_fp8_hip_compat(mla)
     setattr(mla, _MARKER, True)
     return True
 

@@ -490,3 +490,48 @@ def test_mixed_and_fused_branches_compose_with_installed_kimi_model_loader():
         torch.testing.assert_close(proj.fp_gate.weight, torch.cat(gate_rows),
                                    rtol=0, atol=0)
         assert torch.all(model.direct.weight == 1)
+
+
+@pytest.mark.parametrize('mode', ['shared','off','master_off','unsupported','static','no_fused','empty','float32'])
+def test_shared_qkv_activation_quantization_contract(monkeypatch,mode):
+    from lightop import quant
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs,'VLLM_HCU_KIMI_SHARE_QKV_QUANT',mode!='off')
+    monkeypatch.setattr(henvs,'VLLM_HCU_USE_CUSTOM_OPS',mode!='master_off')
+    monkeypatch.setattr(henvs,'VLLM_HCU_USE_FUSED_SILU_MUL_QUANT',mode!='no_fused')
+    monkeypatch.setattr(henvs,'VLLM_HCU_USE_FUSED_RMS_QUANT',False)
+    quant_calls=[];normal=[];shared=[]
+    def quantize(x):
+        pair=(x.to(torch.int8),torch.ones((*x.shape[:-1],1)))
+        quant_calls.append(pair)
+        return pair
+    monkeypatch.setattr(quant,'per_token_quant_int8',quantize)
+    class Column(nn.Module):
+        def __init__(self,name,offset):
+            super().__init__();self.name=name;self.offset=offset
+            self.scheme=SimpleNamespace(input_symmetric=True,
+                is_static_input_scheme=mode=='static',
+                supports_quanted_inputs=lambda:mode!='unsupported')
+        def forward(self,x):
+            normal.append(self.name);return x[:,:2]+self.offset,None
+        def _forward_with_hcu_quanted(self,x,pair):
+            shared.append((self.name,pair));return (pair[0]*pair[1]).to(x.dtype)[:,:2]+self.offset,None
+    class Gate(nn.Module):
+        def forward(self,x):
+            normal.append('gate');return x[:,:3]+10,None
+    projection=KimiK3MixedKDAProjection.__new__(KimiK3MixedKDAProjection)
+    nn.Module.__init__(projection)
+    for name,offset in [('q_proj',0),('k_proj',2),('v_proj',4)]:setattr(projection,name,Column(name,offset))
+    projection.fp_gate=Gate()
+    x=torch.arange(12).reshape(3,4).to(torch.float32 if mode=='float32' else torch.bfloat16)
+    if mode=='empty':x=x[:0]
+    before=x.clone();actual,bias=projection(x)
+    expected=torch.cat([x[:,:2],x[:,:2]+2,x[:,:2]+4,x[:,:3]+10],dim=-1)
+    assert torch.equal(actual,expected) and torch.equal(x,before) and bias is None
+    if mode=='shared':
+        assert len(quant_calls)==1 and len(shared)==3 and normal==['gate']
+        assert all(pair is quant_calls[0] for _,pair in shared)
+    else:
+        assert not quant_calls and not shared
+        assert normal==['q_proj','k_proj','v_proj','gate']

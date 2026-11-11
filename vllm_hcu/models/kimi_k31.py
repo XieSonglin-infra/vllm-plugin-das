@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import torch
 from torch import nn
 
@@ -325,7 +327,7 @@ class KimiK31ForConditionalGeneration(
 
         language_prefix = maybe_prefix(prefix, "language_model")
         self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
+            vllm_config=self._dense_bootstrap_config(),
             hf_config=self.text_config,
             prefix=language_prefix,
             architectures=["KimiLinearForCausalLM"],
@@ -334,6 +336,29 @@ class KimiK31ForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+
+    def _dense_bootstrap_config(self):
+        # KimiLinear constructs a temporary dense MLA before DSA replacement.
+        # A global sparse backend/packed cache is invalid for that constructor.
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        config = self.vllm_config
+        if not (self._uses_sparse_dsa
+                and config.cache_config.cache_dtype == "fp8_ds_mla"
+                and config.attention_config.backend
+                    == AttentionBackendEnum.FLASHMLA_SPARSE):
+            return config
+        if set(self.text_config.linear_attn_config["full_attn_layers"]) != set(
+                self.dsa_layer_indices):
+            raise ValueError("packed K31 bootstrap requires all MLA layers to be DSA")
+        dense = copy.copy(config)
+        dense.attention_config = copy.copy(config.attention_config)
+        dense.attention_config.backend = None
+        dense.cache_config = copy.copy(config.cache_config)
+        dense.cache_config.cache_dtype = "fp8_e4m3"
+        # Quantization, PP/TP, and the static registration map stay shared.
+        # _replace_with_sparse_dsa uses self.vllm_config, the original config.
+        return dense
 
     def _validate_sparse_dsa_config(self) -> None:
         dsa = self.text_config.dsa_config
@@ -398,8 +423,13 @@ class KimiK31ForConditionalGeneration(
         # The outer attention owns the checkpoint parameters in both dense
         # and sparse modes. Keep the forward reference without registering a
         # second owner, so IPC/state_dict paths do not depend on context size.
-        del sparse._modules["indexer"]
-        object.__setattr__(sparse, "indexer", indexer)
+        for owner in (sparse, sparse.mla_attn):
+            # Newer vLLM also registers the reference on MLAAttention itself.
+            # Neither consumer owns checkpoint parameters; the outer attention
+            # already registered the sole canonical indexer above.
+            if owner._modules.get("indexer") is indexer:
+                del owner._modules["indexer"]
+                object.__setattr__(owner, "indexer", indexer)
         if getattr(old, "_hcu_fused_output_gate", False):
             sparse._hcu_fused_output_gate = True
         attention.mla_attn = sparse

@@ -1104,6 +1104,10 @@ def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
             "UpstreamSparseMetadataBuilder", (), {}
         ),
     )
+    # This CPU stub test must not import the native workspace through the
+    # deliberately stubbed vllm.config module.
+    _install_stub(monkeypatch, "vllm.v1.worker.workspace",
+                  current_workspace_manager=lambda: None)
     module_name = "_vllm_hcu_cpu_test_flashmla_sparse_backend"
     source = (
         Path(__file__).resolve().parents[2]

@@ -420,6 +420,50 @@ def install_ipc_quant_support(module: ModuleType) -> None:
         allowlist["compressed-tensors"] = compressed_tensors_ipc_enabled
 
 
+def _bounded_socket_path(get_socket_path, identifier, socket_dir):
+    """Keep UUID/PP identity while reserving AF_UNIX space for the draft role."""
+    import hashlib
+    import os
+
+    path = get_socket_path(identifier, socket_dir)
+    limit = 107 - len(".draft")
+    if len(os.fsencode(path)) <= limit:
+        return path
+    directory = os.path.dirname(path)
+    # The directory is operator-selected; never silently move the socket.
+    available = limit - len(os.fsencode(directory)) - 1 - len("wc-.sock")
+    if available < 16:
+        raise ValueError(
+            f"Weight cache socket directory is too long: {directory!r}; "
+            "choose a shorter directory (at least 64 bits of socket identity required)"
+        )
+    digest = hashlib.sha256(os.fsencode(os.path.basename(path))).hexdigest()
+    return os.path.join(directory, f"wc-{digest[:min(32, available)]}.sock")
+
+
+def validate_preload_socket_dir(socket_dir):
+    """Check ownership, AF_UNIX length and filesystem support before loading."""
+    import os
+    import secrets
+    import socket
+    from vllm.model_executor.model_loader.weight_cache import protocol
+
+    directory = protocol.get_socket_dir(socket_dir)
+    protocol.ensure_private_socket_dir(directory)
+    identifier = "preflight-" + secrets.token_hex(24)
+    path = _bounded_socket_path(protocol.get_socket_path, identifier, directory) + ".draft"
+    sock = socket.socket(socket.AF_UNIX)
+    bound = False
+    try:
+        sock.bind(path)
+        bound = True
+    finally:
+        sock.close()
+        if bound:
+            os.unlink(path)
+    return directory
+
+
 def _uuid_socket_path(torch_module, get_socket_path, socket_dir):
     """Use the UUID of the current logical device, independent of visibility order."""
     import re
@@ -429,7 +473,39 @@ def _uuid_socket_path(torch_module, get_socket_path, socket_dir):
     value = getattr(props, "uuid", None)
     if value is None or not re.fullmatch(r"[A-Za-z0-9_-]+", str(value)):
         raise RuntimeError("weight cache requires a stable, filesystem-safe GPU UUID")
-    return get_socket_path(_pp_socket_identifier("uuid-" + str(value)), socket_dir)
+    return _bounded_socket_path(
+        get_socket_path, _pp_socket_identifier("uuid-" + str(value)), socket_dir
+    )
+
+
+def install_daemon_workspace(module: ModuleType) -> None:
+    """Match engine workspace initialization before TP daemon model construction."""
+    import functools
+
+    cls = module.WeightCacheDaemon
+    original = cls.load_model
+    if getattr(original, "_hcu_preload_workspace", False):
+        return
+
+    @functools.wraps(original)
+    def load_model(self):
+        from vllm.v1.worker.workspace import (
+            init_workspace_manager, is_workspace_manager_initialized,
+        )
+
+        module.torch.accelerator.set_device_index(self.tp_rank)
+        if not is_workspace_manager_initialized():
+            parallel = self.vllm_config.parallel_config
+            spec = getattr(self.vllm_config, "speculative_config", None)
+            init_workspace_manager(
+                module.torch.device("cuda", self.tp_rank),
+                num_ubatches=2 if getattr(parallel, "enable_dbo", False) else 1,
+                num_lanes=2 if getattr(spec, "method", None) == "dspark" else 1,
+            )
+        return original(self)
+
+    load_model._hcu_preload_workspace = True
+    cls.load_model = load_model
 
 
 def install_uuid_daemon(module: ModuleType) -> None:
@@ -671,7 +747,7 @@ def ipc_cache_resident_memory(vllm_config, gpu_uuid=None, socket_dir=None):
     identifier = "uuid-" + str(gpu_uuid)
     if pp_size > 1:
         identifier = f"{identifier}-pp{pp_rank}"
-    base = protocol.get_socket_path(identifier, socket_dir)
+    base = _bounded_socket_path(protocol.get_socket_path, identifier, socket_dir)
 
     roles = [("target", base)]
     spec = getattr(vllm_config, "speculative_config", None)
